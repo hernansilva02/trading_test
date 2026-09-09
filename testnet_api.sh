@@ -1,0 +1,4 @@
+#!/bin/bash
+
+export BINANCE_API_KEY="EDhO76o2JC8TBNKDROqjwS1olstWve4KFBcF9K7jxULiMigrroo0G6UJnZwMswCq"
+export BINANCE_API_SECRET="Wc6T0V1S57xUjIzwTE9puro28obhanBFs7FkP4aGEEjpTrsVEDwdlSmdPfbjH8la"

@@ -1,0 +1,21 @@
+#!/bin/bash
+python3 /home/hernan/trading/trader.py \
+  --symbol SOLUSDT \
+  --interval 15m \
+  --poll-seconds 60 \
+  --quote-size 10 \
+  --fast-sma 9 \
+  --slow-sma 21 \
+  --min-sma-gap-pct 0.10 \
+  --buy-crossover-lookback-candles 3 \
+  --buy-rsi-min 50 \
+  --buy-rsi-max 70 \
+  --cooldown-candles 3 \
+  --trailing-thresholds 1:0,2:1,3:2 \
+  --stop-loss-pct 2 \
+  --take-profit-pct 4 \
+  --hosted-stop-loss \
+  --state-file /home/hernan/trading/.trader-state-SOLUSDT-testnet.json \
+  --log-file /home/hernan/trading/trader-SOLUSDT-testnet.log \
+  --execute \
+  --verbose

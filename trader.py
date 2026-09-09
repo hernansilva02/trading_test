@@ -4,17 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import hmac
+import http.client
 import json
 import logging
+import logging.handlers
+import math
 import os
+import re
+import secrets
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any
@@ -23,10 +30,55 @@ from typing import Any
 LOGGER = logging.getLogger("trader")
 TESTNET_URL = "https://testnet.binance.vision"
 MAINNET_URL = "https://api.binance.com"
+HISTORY_SCHEMA_VERSION = 1
+INTENT_SCHEMA_VERSION = 2
+BINANCE_CLIENT_ORDER_ID = re.compile(r"^[A-Za-z0-9_-]{1,36}$")
+OPERATIONS_TIMEZONE = timezone(timedelta(hours=-3))
+TERMINAL_ORDER_STATUSES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}
+ORDER_STATUSES = TERMINAL_ORDER_STATUSES | {
+    "NEW",
+    "PENDING_NEW",
+    "PARTIALLY_FILLED",
+    "PENDING_CANCEL",
+}
+INACTIVE_ORDER_STATUSES = {"CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "FILLED"}
 
 
 class BinanceError(RuntimeError):
     """Raised when Binance rejects an API request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        http_status: int | None = None,
+        ambiguous: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+        self.ambiguous = ambiguous
+
+    @property
+    def order_not_found(self) -> bool:
+        return self.code == -2013
+
+    @property
+    def cancel_order_not_found(self) -> bool:
+        return self.code == -2011
+
+
+class InsufficientMarketData(BinanceError):
+    """Raised while Binance has too few completed candles for the strategy."""
+
+
+class PendingIntentError(RuntimeError):
+    """Raised when an order intent cannot yet be resolved safely."""
+
+
+class TradeJournalError(RuntimeError):
+    """Raised when an executed strategy fill cannot be persisted."""
 
 
 @dataclass(frozen=True)
@@ -42,6 +94,16 @@ class StrategyConfig:
     sell_rsi_above: float | None
     stop_loss_pct: float
     take_profit_pct: float
+    min_sma_gap_pct: float = 0.1
+    buy_crossover_lookback_candles: int = 3
+    buy_rsi_min: float = 50.0
+    buy_rsi_max: float = 70.0
+    cooldown_candles: int = 3
+    trailing_thresholds: tuple[tuple[float, float], ...] = (
+        (1.0, 0.0),
+        (2.0, 1.0),
+        (3.0, 2.0),
+    )
 
 
 @dataclass(frozen=True)
@@ -61,6 +123,12 @@ class Decision:
     fast_sma: float
     slow_sma: float
     rsi: float
+
+
+@dataclass(frozen=True)
+class Candle:
+    close: float
+    close_time_ms: int
 
 
 class BinanceClient:
@@ -103,28 +171,52 @@ class BinanceClient:
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
-                return json.loads(response.read().decode())
+                try:
+                    return json.loads(response.read().decode())
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise BinanceError(
+                        "Binance returned a malformed successful response",
+                        ambiguous=method != "GET",
+                    ) from error
         except urllib.error.HTTPError as error:
             body = error.read().decode(errors="replace")
             try:
-                detail = json.loads(body).get("msg", body)
+                payload = json.loads(body)
+                detail = payload.get("msg", body) if isinstance(payload, dict) else body
+                binance_code = payload.get("code") if isinstance(payload, dict) else None
             except json.JSONDecodeError:
                 detail = body
-            raise BinanceError(f"Binance HTTP {error.code}: {detail}") from error
+                binance_code = None
+            raise BinanceError(
+                f"Binance HTTP {error.code}: {detail}",
+                code=binance_code if isinstance(binance_code, int) else None,
+                http_status=error.code,
+                ambiguous=(
+                    error.code == 408
+                    or error.code >= 500
+                    or binance_code in {-1006, -1007}
+                ),
+            ) from error
         except urllib.error.URLError as error:
-            raise BinanceError(f"Could not reach Binance: {error.reason}") from error
+            raise BinanceError(
+                f"Could not reach Binance: {error.reason}", ambiguous=True
+            ) from error
+        except TimeoutError as error:
+            raise BinanceError("Binance request timed out", ambiguous=True) from error
+        except (OSError, http.client.HTTPException) as error:
+            raise BinanceError(f"Binance connection failed: {error}", ambiguous=True) from error
 
     def synchronize_time(self) -> None:
         response = self._request("GET", "/api/v3/time")
         self._time_offset_ms = int(response["serverTime"]) - int(time.time() * 1000)
 
-    def closes(self, symbol: str, interval: str, limit: int) -> list[float]:
+    def candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
         rows = self._request(
             "GET",
             "/api/v3/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
         )
-        return [float(row[4]) for row in rows]
+        return [Candle(float(row[4]), int(row[6])) for row in rows]
 
     def symbol_info(self, symbol: str) -> dict[str, Any]:
         response = self._request("GET", "/api/v3/exchangeInfo", {"symbol": symbol})
@@ -148,7 +240,9 @@ class BinanceClient:
                 return float(balance["free"])
         return 0.0
 
-    def market_buy(self, symbol: str, quote_quantity: float) -> dict[str, Any]:
+    def market_buy(
+        self, symbol: str, quote_quantity: float, client_order_id: str
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             "/api/v3/order",
@@ -158,11 +252,14 @@ class BinanceClient:
                 "type": "MARKET",
                 "quoteOrderQty": decimal_string(quote_quantity),
                 "newOrderRespType": "FULL",
+                "newClientOrderId": client_order_id,
             },
             signed=True,
         )
 
-    def market_sell(self, symbol: str, quantity: float) -> dict[str, Any]:
+    def market_sell(
+        self, symbol: str, quantity: float, client_order_id: str
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             "/api/v3/order",
@@ -172,11 +269,14 @@ class BinanceClient:
                 "type": "MARKET",
                 "quantity": decimal_string(quantity),
                 "newOrderRespType": "FULL",
+                "newClientOrderId": client_order_id,
             },
             signed=True,
         )
 
-    def place_stop_loss(self, symbol: str, quantity: float, stop_price: float) -> dict[str, Any]:
+    def place_stop_loss(
+        self, symbol: str, quantity: float, stop_price: float, client_order_id: str
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             "/api/v3/order",
@@ -187,6 +287,7 @@ class BinanceClient:
                 "quantity": decimal_string(quantity),
                 "stopPrice": decimal_string(stop_price),
                 "newOrderRespType": "RESULT",
+                "newClientOrderId": client_order_id,
             },
             signed=True,
         )
@@ -194,6 +295,22 @@ class BinanceClient:
     def order(self, symbol: str, order_id: int) -> dict[str, Any]:
         return self._request(
             "GET", "/api/v3/order", {"symbol": symbol, "orderId": order_id}, signed=True
+        )
+
+    def order_by_client_id(self, symbol: str, client_order_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            "/api/v3/order",
+            {"symbol": symbol, "origClientOrderId": client_order_id},
+            signed=True,
+        )
+
+    def trades(self, symbol: str, order_id: int) -> list[dict[str, Any]]:
+        return self._request(
+            "GET",
+            "/api/v3/myTrades",
+            {"symbol": symbol, "orderId": order_id},
+            signed=True,
         )
 
     def cancel_order(self, symbol: str, order_id: int) -> dict[str, Any]:
@@ -241,25 +358,126 @@ def decide(
     slow = sum(closes[-config.slow_sma :]) / config.slow_sma
     previous_fast = sum(closes[-config.fast_sma - 1 : -1]) / config.fast_sma
     previous_slow = sum(closes[-config.slow_sma - 1 : -1]) / config.slow_sma
-    bullish_crossover = previous_fast <= previous_slow and fast > slow
-    bearish_crossover = previous_fast >= previous_slow and fast < slow
+    fast_slope = fast - previous_fast
+    slow_slope = slow - previous_slow
+    bullish_gap_pct = (fast - slow) / slow * 100
+    bearish_gap_pct = (slow - fast) / slow * 100
+    bullish_crossover_age: int | None = None
+    available_crossovers = min(
+        config.buy_crossover_lookback_candles,
+        len(closes) - config.slow_sma,
+    )
+    for age in range(available_crossovers):
+        end = len(closes) - age
+        candidate_fast = sum(closes[end - config.fast_sma : end]) / config.fast_sma
+        candidate_slow = sum(closes[end - config.slow_sma : end]) / config.slow_sma
+        candidate_previous_fast = (
+            sum(closes[end - config.fast_sma - 1 : end - 1]) / config.fast_sma
+        )
+        candidate_previous_slow = (
+            sum(closes[end - config.slow_sma - 1 : end - 1]) / config.slow_sma
+        )
+        if candidate_previous_fast <= candidate_previous_slow and candidate_fast > candidate_slow:
+            bullish_crossover_age = age
+            break
+    bullish_crossover = bullish_crossover_age is not None
+    strong_bearish_trend = (
+        fast < slow
+        and slow_slope < 0
+        and bearish_gap_pct >= config.min_sma_gap_pct
+    )
     rsi = simple_rsi(closes, config.rsi_period)
 
     if position is None:
-        conditions: list[tuple[bool, str]] = []
+        conditions: list[tuple[bool, str, str]] = []
         if config.buy_on_bullish_trend:
-            conditions.append((bullish_crossover, "fast SMA crossed above slow SMA"))
+            conditions.extend(
+                (
+                    (
+                        bullish_crossover,
+                        "bullish SMA crossover confirmed "
+                        f"{bullish_crossover_age or 0} closed candle(s) ago",
+                        "no bullish SMA crossover in the last "
+                        f"{config.buy_crossover_lookback_candles} closed candles "
+                        f"(current fast={fast:.8f}, slow={slow:.8f})",
+                    ),
+                    (
+                        slow_slope > 0,
+                        "slow SMA rising",
+                        f"slow SMA not rising (slope={slow_slope:.8f})",
+                    ),
+                    (
+                        fast_slope > 0,
+                        "fast SMA rising",
+                        f"fast SMA not rising (slope={fast_slope:.8f})",
+                    ),
+                    (
+                        fast_slope > slow_slope,
+                        "fast SMA slope exceeds slow SMA slope",
+                        f"fast slope {fast_slope:.8f} <= slow slope {slow_slope:.8f}",
+                    ),
+                    (
+                        bullish_gap_pct >= config.min_sma_gap_pct,
+                        f"bullish SMA gap {bullish_gap_pct:.3f}% >= {config.min_sma_gap_pct:g}%",
+                        f"bullish SMA gap {bullish_gap_pct:.3f}% below minimum "
+                        f"{config.min_sma_gap_pct:g}%",
+                    ),
+                )
+            )
         if config.buy_below is not None:
-            conditions.append((price <= config.buy_below, f"price <= {config.buy_below:g}"))
+            conditions.append(
+                (
+                    price <= config.buy_below,
+                    f"price {price:.8f} <= {config.buy_below:g}",
+                    f"price {price:.8f} above buy limit {config.buy_below:g}",
+                )
+            )
         if config.buy_rsi_below is not None:
-            conditions.append((rsi <= config.buy_rsi_below, f"RSI <= {config.buy_rsi_below:g}"))
-        if conditions and all(matched for matched, _ in conditions):
-            return Decision("BUY", tuple(reason for _, reason in conditions), price, fast, slow, rsi)
-        return Decision("HOLD", ("entry conditions not met",), price, fast, slow, rsi)
+            conditions.append(
+                (
+                    rsi <= config.buy_rsi_below,
+                    f"RSI {rsi:.2f} <= {config.buy_rsi_below:g}",
+                    f"RSI {rsi:.2f} above configured limit {config.buy_rsi_below:g}",
+                )
+            )
+        entry_enabled = bool(conditions)
+        if entry_enabled:
+            conditions.extend(
+                (
+                    (
+                        rsi >= config.buy_rsi_min,
+                        f"RSI {rsi:.2f} >= {config.buy_rsi_min:g}",
+                        f"RSI {rsi:.2f} below minimum {config.buy_rsi_min:g}",
+                    ),
+                    (
+                        rsi <= config.buy_rsi_max,
+                        f"RSI {rsi:.2f} <= {config.buy_rsi_max:g}",
+                        f"RSI {rsi:.2f} above maximum {config.buy_rsi_max:g}",
+                    ),
+                )
+            )
+        if conditions and all(matched for matched, _, _ in conditions):
+            return Decision(
+                "BUY",
+                tuple(success for _, success, _ in conditions),
+                price,
+                fast,
+                slow,
+                rsi,
+            )
+        if not entry_enabled:
+            reasons = ("BUY blocked: no entry rule is enabled",)
+        else:
+            failed = [failure for matched, _, failure in conditions if not matched]
+            reasons = ("BUY blocked: " + "; ".join(failed),)
+        return Decision("HOLD", reasons, price, fast, slow, rsi)
 
     exit_reasons: list[str] = []
-    if config.sell_on_bearish_trend and bearish_crossover:
-        exit_reasons.append("fast SMA crossed below slow SMA")
+    if config.sell_on_bearish_trend and strong_bearish_trend:
+        exit_reasons.append(
+            f"bearish SMA trend: gap {bearish_gap_pct:.3f}% >= "
+            f"{config.min_sma_gap_pct:g}% and slow SMA falling"
+        )
     if config.sell_above is not None and price >= config.sell_above:
         exit_reasons.append(f"price >= {config.sell_above:g}")
     if config.sell_rsi_above is not None and rsi >= config.sell_rsi_above:
@@ -270,7 +488,17 @@ def decide(
         exit_reasons.append(f"take profit {config.take_profit_pct:g}%")
     if exit_reasons:
         return Decision("SELL", tuple(exit_reasons), price, fast, slow, rsi)
-    return Decision("HOLD", ("exit conditions not met",), price, fast, slow, rsi)
+    return Decision(
+        "HOLD",
+        (
+            f"SELL blocked: bearish gap={max(0.0, bearish_gap_pct):.3f}%, "
+            f"slow slope={slow_slope:.8f}, return={(price / position.entry_price - 1) * 100:.3f}%",
+        ),
+        price,
+        fast,
+        slow,
+        rsi,
+    )
 
 
 def load_position(path: Path, symbol: str) -> Position | None:
@@ -288,14 +516,546 @@ def load_position(path: Path, symbol: str) -> Position | None:
     return position
 
 
-def save_position(path: Path, position: Position | None) -> None:
-    if position is None:
-        path.unlink(missing_ok=True)
-        return
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(asdict(position), indent=2) + "\n")
-    temporary.replace(path)
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    fsync_directory(path.parent)
+
+
+def atomic_delete(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    fsync_directory(path.parent)
+
+
+def save_position(path: Path, position: Position | None) -> None:
+    if position is None:
+        atomic_delete(path)
+        return
+    atomic_write_text(path, json.dumps(asdict(position), indent=2) + "\n")
+
+
+def order_intent_path(state_path: Path, symbol: str, network: str) -> Path:
+    return state_path.parent / f".trader-intent-{symbol}-{network}.json"
+
+
+def credential_fingerprint(api_key: str | None = None) -> str:
+    value = os.environ.get("BINANCE_API_KEY", "") if api_key is None else api_key
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def client_credential_fingerprint(client: BinanceClient) -> str:
+    return credential_fingerprint(getattr(client, "api_key", None))
+
+
+def new_client_order_id(kind: str) -> str:
+    code = {
+        "market_buy": "B",
+        "strategy_sell": "S",
+        "protective_market_sell": "P",
+        "hosted_stop": "H",
+    }[kind]
+    timestamp = format(time.time_ns(), "x")
+    return f"trd-{code}-{timestamp}-{secrets.token_hex(6)}"[:36]
+
+
+def validate_order_intent(
+    intent: Any, path: Path, symbol: str, network: str
+) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "symbol",
+        "network",
+        "client_order_id",
+        "kind",
+        "side",
+        "order_type",
+        "source",
+        "reasons",
+        "quantity",
+        "quote_quantity",
+        "stop_price",
+        "position_quantity",
+        "entry_price",
+        "prior_stop_price",
+        "signal_candle_close_time_ms",
+        "cancel_order_id",
+        "cancel_completed",
+        "submission_attempted",
+        "credential_fingerprint",
+    }
+    if not isinstance(intent, dict) or set(intent) != required:
+        raise RuntimeError(f"Invalid order intent file {path}: invalid fields")
+    if (
+        intent["schema_version"] != INTENT_SCHEMA_VERSION
+        or intent["symbol"] != symbol
+        or intent["network"] != network
+        or intent["kind"]
+        not in {"market_buy", "strategy_sell", "protective_market_sell", "hosted_stop"}
+        or intent["side"] not in {"BUY", "SELL"}
+        or intent["order_type"] not in {"MARKET", "STOP_LOSS"}
+        or intent["source"] not in {"strategy", "hosted_stop_loss", "protective_market"}
+        or not isinstance(intent["client_order_id"], str)
+        or BINANCE_CLIENT_ORDER_ID.fullmatch(intent["client_order_id"]) is None
+        or not isinstance(intent["reasons"], list)
+        or not all(isinstance(reason, str) for reason in intent["reasons"])
+        or not isinstance(intent["cancel_completed"], bool)
+        or not isinstance(intent["submission_attempted"], bool)
+        or not isinstance(intent["credential_fingerprint"], str)
+        or re.fullmatch(r"[0-9a-f]{16}", intent["credential_fingerprint"]) is None
+    ):
+        raise RuntimeError(f"Invalid order intent file {path}: invalid values")
+    for key in (
+        "quantity",
+        "quote_quantity",
+        "stop_price",
+        "position_quantity",
+        "entry_price",
+        "prior_stop_price",
+    ):
+        value = intent[key]
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise RuntimeError(f"Invalid order intent file {path}: invalid {key}")
+    for key in ("signal_candle_close_time_ms", "cancel_order_id"):
+        value = intent[key]
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise RuntimeError(f"Invalid order intent file {path}: invalid {key}")
+    kind = intent["kind"]
+    if (
+        (kind == "market_buy" and (intent["side"], intent["order_type"]) != ("BUY", "MARKET"))
+        or (
+            kind in {"strategy_sell", "protective_market_sell"}
+            and (intent["side"], intent["order_type"]) != ("SELL", "MARKET")
+        )
+        or (kind == "hosted_stop" and (intent["side"], intent["order_type"]) != ("SELL", "STOP_LOSS"))
+        or (kind == "market_buy" and intent["quote_quantity"] is None)
+        or (kind != "market_buy" and intent["quantity"] is None)
+        or (kind == "hosted_stop" and intent["stop_price"] is None)
+        or (kind != "market_buy" and (intent["position_quantity"] is None or intent["entry_price"] is None))
+        or (intent["cancel_completed"] and intent["cancel_order_id"] is None)
+        or (kind == "market_buy" and intent["source"] != "strategy")
+        or (kind == "strategy_sell" and intent["source"] != "strategy")
+        or (kind == "protective_market_sell" and intent["source"] != "protective_market")
+        or (kind == "hosted_stop" and intent["source"] != "hosted_stop_loss")
+        or (kind == "market_buy" and intent["quantity"] is not None)
+        or (kind != "market_buy" and intent["quote_quantity"] is not None)
+        or (kind in {"market_buy", "protective_market_sell"} and intent["cancel_order_id"] is not None)
+    ):
+        raise RuntimeError(f"Invalid order intent file {path}: inconsistent order parameters")
+    return intent
+
+
+def load_order_intent(path: Path, symbol: str, network: str) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        intent = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Invalid order intent file {path}: {error}") from error
+    return validate_order_intent(intent, path, symbol, network)
+
+
+def save_order_intent(path: Path, intent: dict[str, Any]) -> None:
+    validate_order_intent(intent, path, intent["symbol"], intent["network"])
+    atomic_write_text(path, json.dumps(intent, indent=2, sort_keys=True) + "\n")
+
+
+def clear_order_intent(path: Path) -> None:
+    atomic_delete(path)
+
+
+def process_lock_path(symbol: str, network: str) -> Path:
+    runtime_directory = Path("/tmp") / f"binance-trader-locks-{os.getuid()}"
+    return runtime_directory / f"{symbol}-{network}.lock"
+
+
+def acquire_process_lock(symbol: str, network: str) -> Any:
+    path = process_lock_path(symbol, network)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise RuntimeError(
+            f"another trader is already running for {symbol} on {network} ({path})"
+        ) from error
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+def cancel_order_reconciled(
+    client: BinanceClient, symbol: str, order_id: int
+) -> dict[str, Any]:
+    try:
+        return client.cancel_order(symbol, order_id)
+    except BinanceError as cancel_error:
+        if not cancel_error.ambiguous and not cancel_error.cancel_order_not_found:
+            raise
+        order = client.order(symbol, order_id)
+        if order.get("status") in INACTIVE_ORDER_STATUSES:
+            return order
+        raise cancel_error
+
+
+def trade_history_path(state_path: Path, symbol: str, network: str) -> Path:
+    return state_path.parent / f".trader-history-{symbol}-{network}.json"
+
+
+def operational_log_path(state_path: Path, symbol: str, network: str) -> Path:
+    return state_path.parent / f"trader-{symbol}-{network}.log"
+
+
+def trade_operations_log_path(state_path: Path, symbol: str, network: str) -> Path:
+    return state_path.parent / f"trader-operations-{symbol}-{network}.log"
+
+
+def empty_trade_history(symbol: str, network: str) -> dict[str, Any]:
+    return {
+        "schema_version": HISTORY_SCHEMA_VERSION,
+        "symbol": symbol,
+        "network": network,
+        "fills": [],
+    }
+
+
+def load_trade_history(path: Path, symbol: str, network: str) -> dict[str, Any]:
+    if not path.exists():
+        return empty_trade_history(symbol, network)
+    try:
+        history = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Invalid trade history file {path}: {error}") from error
+    if not isinstance(history, dict):
+        raise RuntimeError(f"Invalid trade history file {path}: expected a JSON object")
+    if history.get("schema_version") != HISTORY_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Invalid trade history file {path}: unsupported schema version"
+        )
+    if history.get("symbol") != symbol or history.get("network") != network:
+        raise RuntimeError(
+            f"Invalid trade history file {path}: expected {symbol} on {network}"
+        )
+    fills = history.get("fills")
+    if not isinstance(fills, list):
+        raise RuntimeError(f"Invalid trade history file {path}: fills must be an array")
+    required = {
+        "timestamp_utc",
+        "order_id",
+        "side",
+        "source",
+        "status",
+        "quantity",
+        "quote_quantity",
+        "average_price",
+        "reasons",
+    }
+    seen_order_ids: set[int] = set()
+    for index, fill in enumerate(fills):
+        if not isinstance(fill, dict) or not required <= fill.keys():
+            raise RuntimeError(f"Invalid trade history file {path}: invalid fill at index {index}")
+        numeric = (fill["quantity"], fill["quote_quantity"], fill["average_price"])
+        if (
+            isinstance(fill["order_id"], bool)
+            or not isinstance(fill["order_id"], int)
+            or fill["order_id"] <= 0
+            or not all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                and value > 0
+                for value in numeric
+            )
+            or fill["side"] not in {"BUY", "SELL"}
+            or fill["source"] not in {"strategy", "hosted_stop_loss", "protective_market"}
+            or not isinstance(fill["status"], str)
+            or fill["status"] not in ORDER_STATUSES
+            or not isinstance(fill["timestamp_utc"], str)
+            or not isinstance(fill["reasons"], list)
+            or not all(isinstance(reason, str) for reason in fill["reasons"])
+            or (
+                "signal_candle_close_time_utc" in fill
+                and not isinstance(fill["signal_candle_close_time_utc"], str)
+            )
+        ):
+            raise RuntimeError(f"Invalid trade history file {path}: invalid fill at index {index}")
+        if fill["order_id"] in seen_order_ids:
+            raise RuntimeError(f"Invalid trade history file {path}: duplicate order ID")
+        seen_order_ids.add(fill["order_id"])
+    return history
+
+
+def render_trade_operations_log(history: dict[str, Any]) -> str:
+    lines = []
+    for fill in history["fills"]:
+        try:
+            timestamp = datetime.fromisoformat(fill["timestamp_utc"])
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("Trade history contains an invalid UTC timestamp") from error
+        if timestamp.tzinfo is None:
+            raise RuntimeError("Trade history UTC timestamp is missing a timezone")
+        lines.append(
+            "\t".join(
+                (
+                    f"timestamp_gmt_minus_3={timestamp.astimezone(OPERATIONS_TIMEZONE).isoformat()}",
+                    f"side={fill['side']}",
+                    f"order_id={fill['order_id']}",
+                    f"source={fill['source']}",
+                    f"status={fill['status']}",
+                    f"quantity={fill['quantity']:.12g}",
+                    f"quote_quantity={fill['quote_quantity']:.12g}",
+                    f"average_price={fill['average_price']:.12g}",
+                    "reasons=" + json.dumps(fill["reasons"], ensure_ascii=True),
+                )
+            )
+        )
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def save_trade_history(path: Path, history: dict[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(history, indent=2, sort_keys=True) + "\n")
+    operations_path = trade_operations_log_path(
+        path, history["symbol"], history["network"]
+    )
+    atomic_write_text(operations_path, render_trade_operations_log(history))
+
+
+def initialize_trade_history(path: Path, symbol: str, network: str) -> None:
+    history = load_trade_history(path, symbol, network)
+    # Rewriting atomically verifies the journal is writable before an order can be submitted.
+    save_trade_history(path, history)
+
+
+def order_timestamp_utc(order: dict[str, Any]) -> str:
+    for key in ("transactTime", "updateTime", "time"):
+        try:
+            milliseconds = float(order[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(milliseconds) and milliseconds > 0:
+            return datetime.fromtimestamp(milliseconds / 1000, timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat()
+
+
+def record_trade_fill(
+    path: Path,
+    symbol: str,
+    network: str,
+    order: dict[str, Any],
+    side: str,
+    source: str,
+    reasons: tuple[str, ...],
+    signal_candle_close_time_ms: int | None = None,
+) -> None:
+    try:
+        order_id = int(order["orderId"])
+        quantity = float(order["executedQty"])
+        quote_quantity = float(order["cummulativeQuoteQty"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("Binance fill is missing valid execution fields") from error
+    if quantity <= 0:
+        return
+    if order_id <= 0 or not all(
+        math.isfinite(value) and value > 0 for value in (quantity, quote_quantity)
+    ):
+        raise RuntimeError("Binance fill quantities must be positive and finite")
+    fill = {
+        "timestamp_utc": order_timestamp_utc(order),
+        "order_id": order_id,
+        "side": side,
+        "source": source,
+        "status": str(order.get("status", "FILLED")),
+        "quantity": quantity,
+        "quote_quantity": quote_quantity,
+        "average_price": quote_quantity / quantity,
+        "reasons": list(reasons),
+    }
+    if signal_candle_close_time_ms is not None:
+        fill["signal_candle_close_time_utc"] = datetime.fromtimestamp(
+            signal_candle_close_time_ms / 1000, timezone.utc
+        ).isoformat()
+    history = load_trade_history(path, symbol, network)
+    for index, existing in enumerate(history["fills"]):
+        if existing["order_id"] == order_id:
+            if existing["side"] != side or existing["source"] != source:
+                raise RuntimeError(f"Trade history order {order_id} conflicts with a prior fill")
+            if quantity < float(existing["quantity"]) or quote_quantity < float(
+                existing["quote_quantity"]
+            ):
+                raise RuntimeError(
+                    f"Trade history order {order_id} cumulative fill regressed"
+                )
+            if (
+                existing["status"] in TERMINAL_ORDER_STATUSES
+                and fill["status"] != existing["status"]
+            ):
+                raise RuntimeError(
+                    f"Trade history order {order_id} terminal status regressed"
+                )
+            history["fills"][index] = fill
+            break
+    else:
+        history["fills"].append(fill)
+    save_trade_history(path, history)
+
+
+def record_trade_fill_safely(
+    path: Path,
+    symbol: str,
+    network: str,
+    order: dict[str, Any],
+    side: str,
+    source: str,
+    reasons: tuple[str, ...],
+    signal_candle_close_time_ms: int | None = None,
+) -> None:
+    try:
+        record_trade_fill(
+            path,
+            symbol,
+            network,
+            order,
+            side,
+            source,
+            reasons,
+            signal_candle_close_time_ms,
+        )
+    except (OSError, RuntimeError) as error:
+        # A fill cannot be rolled back; preserve trading safeguards and make the audit failure loud.
+        LOGGER.critical("Could not record executed fill in %s: %s", path, error)
+
+
+def record_trade_fill_required(
+    path: Path,
+    symbol: str,
+    network: str,
+    order: dict[str, Any],
+    side: str,
+    reasons: tuple[str, ...],
+    signal_candle_close_time_ms: int,
+) -> None:
+    try:
+        record_trade_fill(
+            path,
+            symbol,
+            network,
+            order,
+            side,
+            "strategy",
+            reasons,
+            signal_candle_close_time_ms,
+        )
+    except (OSError, RuntimeError) as error:
+        raise TradeJournalError(
+            f"executed {side} could not be recorded in {path}; trading stopped: {error}"
+        ) from error
+
+
+def record_and_log_hosted_fill(
+    path: Path,
+    symbol: str,
+    network: str,
+    order: dict[str, Any],
+    reasons: tuple[str, ...],
+    entry_price: float,
+    quote_asset: str,
+) -> None:
+    order_id = int(order["orderId"])
+    quantity = float(order.get("executedQty", 0))
+    quote_quantity = float(order.get("cummulativeQuoteQty", 0))
+    previous_quantity = 0.0
+    previous_quote = 0.0
+    try:
+        history = load_trade_history(path, symbol, network)
+        previous = next(
+            (fill for fill in history["fills"] if fill["order_id"] == order_id), None
+        )
+        if previous is not None:
+            previous_quantity = float(previous["quantity"])
+            previous_quote = float(previous["quote_quantity"])
+        record_trade_fill(
+            path,
+            symbol,
+            network,
+            order,
+            "SELL",
+            "hosted_stop_loss",
+            reasons,
+        )
+    except (OSError, RuntimeError) as error:
+        raise TradeJournalError(
+            f"hosted stop fill could not be recorded in {path}; trading stopped: {error}"
+        ) from error
+    delta_quantity = quantity - previous_quantity
+    delta_quote = quote_quantity - previous_quote
+    if delta_quantity <= 0 or delta_quote <= 0:
+        return
+    average_price = delta_quote / delta_quantity
+    gross_pnl = (average_price - entry_price) * delta_quantity
+    LOGGER.info(
+        "%s SELL hosted_stop order_id=%s status=%s quantity=%.8f average=%.8f "
+        "gross_pnl=%.8f %s reason=%s",
+        symbol,
+        order_id,
+        order.get("status", "FILLED"),
+        delta_quantity,
+        average_price,
+        gross_pnl,
+        quote_asset,
+        "; ".join(reasons),
+    )
+
+
+def buy_cooldown_reason(
+    history: dict[str, Any], closed_candles: list[Candle], cooldown_candles: int
+) -> str | None:
+    if cooldown_candles <= 0:
+        return None
+    strategy_sells = [
+        fill
+        for fill in history["fills"]
+        if fill["side"] == "SELL" and fill["source"] == "strategy"
+    ]
+    if not strategy_sells:
+        return None
+    latest = max(strategy_sells, key=lambda fill: fill["timestamp_utc"])
+    timestamp = latest.get("signal_candle_close_time_utc", latest["timestamp_utc"])
+    try:
+        sell_close_ms = int(datetime.fromisoformat(timestamp).timestamp() * 1000)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Trade history contains an invalid cooldown timestamp") from error
+    elapsed = sum(candle.close_time_ms > sell_close_ms for candle in closed_candles)
+    if elapsed >= cooldown_candles:
+        return None
+    return (
+        f"BUY blocked by post-sell cooldown: {elapsed}/{cooldown_candles} "
+        "closed candles elapsed"
+    )
 
 
 def filter_value(symbol_info: dict[str, Any], filter_type: str, key: str) -> str | None:
@@ -387,10 +1147,18 @@ def protective_stop_values(
     stop_loss_pct: float,
     symbol_info: dict[str, Any],
 ) -> tuple[float, float]:
+    tick = filter_value(symbol_info, "PRICE_FILTER", "tickSize") or "0"
+    stop_price = floor_to_step(entry_price * (1 - stop_loss_pct / 100), tick)
+    return stop_order_values(quantity, stop_price, symbol_info)
+
+
+def stop_order_values(
+    quantity: float, stop_price: float, symbol_info: dict[str, Any]
+) -> tuple[float, float]:
     step = filter_value(symbol_info, "LOT_SIZE", "stepSize") or "0"
     tick = filter_value(symbol_info, "PRICE_FILTER", "tickSize") or "0"
     sell_quantity = floor_to_step(quantity, step)
-    stop_price = floor_to_step(entry_price * (1 - stop_loss_pct / 100), tick)
+    stop_price = floor_to_step(stop_price, tick)
     minimum_quantity = float(filter_value(symbol_info, "LOT_SIZE", "minQty") or 0)
     minimum_notional = minimum_market_notional(symbol_info)
     if sell_quantity < minimum_quantity or sell_quantity <= 0:
@@ -406,6 +1174,36 @@ def protective_stop_values(
     return sell_quantity, stop_price
 
 
+def trailing_stop_price(
+    entry_price: float,
+    current_price: float,
+    stop_loss_pct: float,
+    thresholds: tuple[tuple[float, float], ...],
+) -> float:
+    stop_price = entry_price * (1 - stop_loss_pct / 100)
+    profit_pct = (current_price / entry_price - 1) * 100
+    for trigger_pct, protected_profit_pct in thresholds:
+        if profit_pct >= trigger_pct:
+            stop_price = max(stop_price, entry_price * (1 + protected_profit_pct / 100))
+    return stop_price
+
+
+def parse_trailing_thresholds(value: str) -> tuple[tuple[float, float], ...]:
+    try:
+        thresholds = tuple(
+            (float(trigger), float(protected))
+            for item in value.split(",")
+            for trigger, protected in [item.split(":", 1)]
+        )
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated TRIGGER:PROTECTED pairs, for example 1:0,2:1,3:2"
+        ) from error
+    if not thresholds:
+        raise argparse.ArgumentTypeError("at least one trailing threshold is required")
+    return thresholds
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.fast_sma <= 0 or args.slow_sma <= 0 or args.rsi_period <= 0:
         raise ValueError("SMA windows and RSI period must be positive")
@@ -419,8 +1217,1077 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be between 0 and 100")
     if not 0 <= args.stop_loss_pct < 100 or args.take_profit_pct < 0:
         raise ValueError("--stop-loss-pct must be below 100 and risk percentages cannot be negative")
+    if not math.isfinite(args.min_sma_gap_pct) or args.min_sma_gap_pct < 0:
+        raise ValueError("--min-sma-gap-pct must be finite and non-negative")
+    if args.buy_crossover_lookback_candles <= 0:
+        raise ValueError("--buy-crossover-lookback-candles must be positive")
+    if not 0 <= args.buy_rsi_min <= args.buy_rsi_max <= 100:
+        raise ValueError("buy RSI range must satisfy 0 <= --buy-rsi-min <= --buy-rsi-max <= 100")
+    if args.cooldown_candles < 0:
+        raise ValueError("--cooldown-candles cannot be negative")
+    previous_trigger = -math.inf
+    previous_protection = -math.inf
+    for trigger, protection in args.trailing_thresholds:
+        if (
+            not math.isfinite(trigger)
+            or not math.isfinite(protection)
+            or trigger <= 0
+            or protection < 0
+            or protection >= trigger
+            or trigger <= previous_trigger
+            or protection < previous_protection
+        ):
+            raise ValueError(
+                "--trailing-thresholds require increasing positive triggers and non-decreasing "
+                "protections satisfying 0 <= PROTECTED < TRIGGER"
+            )
+        previous_trigger = trigger
+        previous_protection = protection
     if args.live and args.execute and not args.confirm_live:
         raise ValueError("live orders require --confirm-live")
+
+
+def prepare_order_intent(
+    path: Path,
+    symbol: str,
+    network: str,
+    kind: str,
+    source: str,
+    reasons: tuple[str, ...],
+    *,
+    quantity: float | None = None,
+    quote_quantity: float | None = None,
+    stop_price: float | None = None,
+    position: Position | None = None,
+    signal_candle_close_time_ms: int | None = None,
+    cancel_order_id: int | None = None,
+) -> dict[str, Any]:
+    if load_order_intent(path, symbol, network) is not None:
+        raise RuntimeError(f"Cannot prepare another order while an intent exists in {path}")
+    side = "BUY" if kind == "market_buy" else "SELL"
+    intent = {
+        "schema_version": INTENT_SCHEMA_VERSION,
+        "symbol": symbol,
+        "network": network,
+        "client_order_id": new_client_order_id(kind),
+        "kind": kind,
+        "side": side,
+        "order_type": "STOP_LOSS" if kind == "hosted_stop" else "MARKET",
+        "source": source,
+        "reasons": list(reasons),
+        "quantity": quantity,
+        "quote_quantity": quote_quantity,
+        "stop_price": stop_price,
+        "position_quantity": position.quantity if position is not None else None,
+        "entry_price": position.entry_price if position is not None else None,
+        "prior_stop_price": position.stop_price if position is not None else None,
+        "signal_candle_close_time_ms": signal_candle_close_time_ms,
+        "cancel_order_id": cancel_order_id,
+        "cancel_completed": False,
+        "submission_attempted": False,
+        "credential_fingerprint": credential_fingerprint(),
+    }
+    save_order_intent(path, intent)
+    LOGGER.info(
+        "%s intent prepared client_order_id=%s kind=%s",
+        symbol,
+        intent["client_order_id"],
+        kind,
+    )
+    return intent
+
+
+def query_intended_order(
+    client: BinanceClient, intent: dict[str, Any]
+) -> dict[str, Any] | None:
+    try:
+        return client.order_by_client_id(intent["symbol"], intent["client_order_id"])
+    except BinanceError as error:
+        if error.order_not_found:
+            return None
+        LOGGER.warning(
+            "%s intent pending client_order_id=%s: lookup failed: %s",
+            intent["symbol"],
+            intent["client_order_id"],
+            error,
+        )
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} lookup is unresolved"
+        ) from error
+
+
+def validate_cancel_result(
+    canceled: Any, intent: dict[str, Any], cancel_order_id: int
+) -> tuple[float, float]:
+    try:
+        order_id = canceled["orderId"]
+        status = canceled["status"]
+        executed = float(canceled["executedQty"])
+        quote = float(canceled.get("cummulativeQuoteQty", 0))
+    except (KeyError, TypeError, ValueError) as error:
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} received an invalid cancel response"
+        ) from error
+    original_quantity = float(intent["position_quantity"])
+    try:
+        reported_original = float(canceled["origQty"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} received invalid cancel quantities"
+        ) from error
+    if (
+        isinstance(order_id, bool)
+        or not isinstance(order_id, int)
+        or order_id != cancel_order_id
+        or not isinstance(status, str)
+        or status not in INACTIVE_ORDER_STATUSES
+        or not all(math.isfinite(value) and value >= 0 for value in (executed, quote))
+        or (executed > 0 and quote <= 0)
+        or (executed == 0 and quote != 0)
+        or not math.isfinite(reported_original)
+        or reported_original <= 0
+        or not math.isclose(
+            reported_original, original_quantity, rel_tol=1e-9, abs_tol=1e-12
+        )
+        or executed > reported_original
+        or (
+            status == "FILLED"
+            and not math.isclose(
+                executed, reported_original, rel_tol=1e-9, abs_tol=1e-12
+            )
+        )
+        or canceled.get("symbol") != intent["symbol"]
+        or canceled.get("side") != "SELL"
+        or canceled.get("type") != "STOP_LOSS"
+    ):
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} received an inconsistent cancel response"
+        )
+    return executed, quote
+
+
+def finish_cancel_prerequisite(
+    client: BinanceClient,
+    intent_path: Path,
+    intent: dict[str, Any],
+    state_path: Path,
+    history_path: Path,
+    info: dict[str, Any],
+) -> bool:
+    cancel_order_id = intent["cancel_order_id"]
+    if cancel_order_id is None or intent["cancel_completed"]:
+        return True
+    try:
+        canceled = cancel_order_reconciled(client, intent["symbol"], cancel_order_id)
+    except BinanceError as error:
+        LOGGER.warning(
+            "%s intent pending client_order_id=%s: cancel prerequisite unresolved: %s",
+            intent["symbol"],
+            intent["client_order_id"],
+            error,
+        )
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} cancel prerequisite is unresolved"
+        ) from error
+
+    try:
+        canceled_quantity, _ = validate_cancel_result(canceled, intent, cancel_order_id)
+    except PendingIntentError:
+        LOGGER.warning(
+            "%s intent pending client_order_id=%s: invalid cancel prerequisite response",
+            intent["symbol"],
+            intent["client_order_id"],
+        )
+        raise
+    initial_quantity = float(intent["position_quantity"])
+    remaining = max(0.0, initial_quantity - canceled_quantity)
+    updated_position = (
+        Position(
+            intent["symbol"],
+            remaining,
+            float(intent["entry_price"]),
+            None,
+            intent["prior_stop_price"],
+        )
+        if remaining > 0
+        else None
+    )
+    if canceled_quantity > 0:
+        try:
+            record_trade_fill(
+                history_path,
+                intent["symbol"],
+                intent["network"],
+                canceled,
+                "SELL",
+                "hosted_stop_loss",
+                ("hosted stop-loss partially filled during cancellation prerequisite",),
+            )
+        except (OSError, RuntimeError) as error:
+            raise TradeJournalError(
+                f"hosted stop fill could not be recorded in {history_path}; "
+                f"trading stopped: {error}"
+            ) from error
+    save_position(state_path, updated_position)
+
+    if remaining <= 0:
+        clear_order_intent(intent_path)
+        LOGGER.info(
+            "%s intent reconciled/recovered client_order_id=%s: cancel prerequisite filled position",
+            intent["symbol"],
+            intent["client_order_id"],
+        )
+        return False
+
+    available = min(remaining, client.free_balance(info["baseAsset"]))
+    try:
+        if intent["kind"] == "hosted_stop":
+            quantity, stop_price = stop_order_values(
+                available, float(intent["stop_price"]), info
+            )
+            intent["stop_price"] = stop_price
+        else:
+            reference = market_reference_price(
+                client, intent["symbol"], info, float(intent["entry_price"])
+            )
+            quantity = market_sell_quantity(available, reference, info)
+    except ValueError as error:
+        clear_order_intent(intent_path)
+        LOGGER.error(
+            "%s intent failed client_order_id=%s after cancel prerequisite: %s",
+            intent["symbol"],
+            intent["client_order_id"],
+            error,
+        )
+        return False
+    intent["quantity"] = quantity
+    intent["position_quantity"] = remaining
+    intent["cancel_completed"] = True
+    save_order_intent(intent_path, intent)
+    return True
+
+
+def validate_reconciled_order(
+    intent: dict[str, Any], order: Any
+) -> tuple[int, str, float, float]:
+    try:
+        order_id = order["orderId"]
+        status = order["status"]
+        executed = float(order["executedQty"])
+        quote = float(order["cummulativeQuoteQty"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} returned malformed order data"
+        ) from error
+    expected_quantity = (
+        float(intent["quote_quantity"])
+        if intent["kind"] == "market_buy"
+        else float(intent["quantity"])
+    )
+    actual_quantity = quote if intent["kind"] == "market_buy" else executed
+    if (
+        not isinstance(order, dict)
+        or isinstance(order_id, bool)
+        or not isinstance(order_id, int)
+        or order_id <= 0
+        or not isinstance(status, str)
+        or status not in ORDER_STATUSES
+        or not all(math.isfinite(value) and value >= 0 for value in (executed, quote))
+        or (executed > 0 and quote <= 0)
+        or (executed == 0 and quote != 0)
+        or actual_quantity > expected_quantity + max(1e-12, expected_quantity * 1e-10)
+        or order.get("symbol") != intent["symbol"]
+        or order.get("clientOrderId") != intent["client_order_id"]
+        or order.get("side") != intent["side"]
+        or order.get("type") != intent["order_type"]
+        or (
+            intent["kind"] == "hosted_stop"
+            and status == "FILLED"
+            and not math.isclose(
+                executed, expected_quantity, rel_tol=1e-9, abs_tol=1e-12
+            )
+        )
+    ):
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} returned inconsistent order data"
+        )
+    return order_id, status, executed, quote
+
+
+def validate_hosted_stop_order(
+    order: Any, position: Position
+) -> tuple[str, float, float]:
+    try:
+        order_id = order["orderId"]
+        status = order["status"]
+        original = float(order["origQty"])
+        executed = float(order["executedQty"])
+        quote = float(order["cummulativeQuoteQty"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise PendingIntentError(
+            f"hosted stop {position.stop_order_id} returned malformed order data"
+        ) from error
+    if (
+        not isinstance(order, dict)
+        or isinstance(order_id, bool)
+        or not isinstance(order_id, int)
+        or order_id != position.stop_order_id
+        or not isinstance(status, str)
+        or status not in ORDER_STATUSES
+        or order.get("symbol") != position.symbol
+        or order.get("side") != "SELL"
+        or order.get("type") != "STOP_LOSS"
+        or not all(
+            math.isfinite(value) and value >= 0
+            for value in (original, executed, quote)
+        )
+        or original <= 0
+        or not math.isclose(
+            original, position.quantity, rel_tol=1e-9, abs_tol=1e-12
+        )
+        or executed > original
+        or (executed > 0 and quote <= 0)
+        or (executed == 0 and quote != 0)
+        or (
+            status == "FILLED"
+            and not math.isclose(executed, original, rel_tol=1e-9, abs_tol=1e-12)
+        )
+    ):
+        raise PendingIntentError(
+            f"hosted stop {position.stop_order_id} returned inconsistent order data"
+        )
+    return status, executed, original
+
+
+def recovered_buy_quantity(
+    client: BinanceClient,
+    intent: dict[str, Any],
+    order: dict[str, Any],
+    order_id: int,
+    executed: float,
+    quote: float,
+    base_asset: str,
+) -> float:
+    fills = order.get("fills")
+    if fills is not None:
+        if not isinstance(fills, list) or not fills:
+            raise PendingIntentError(
+                f"order intent {intent['client_order_id']} returned invalid BUY fills"
+            )
+        try:
+            commission = 0.0
+            total_quantity = 0.0
+            total_quote = 0.0
+            for fill in fills:
+                if not isinstance(fill, dict) or not isinstance(
+                    fill.get("commissionAsset"), str
+                ):
+                    raise ValueError("invalid fill")
+                value = float(fill["commission"])
+                quantity = float(fill["qty"])
+                quote_quantity = (
+                    float(fill["quoteQty"])
+                    if "quoteQty" in fill
+                    else quantity * float(fill["price"])
+                )
+                if not all(
+                    math.isfinite(number) and number >= 0
+                    for number in (value, quantity, quote_quantity)
+                ):
+                    raise ValueError("invalid commission")
+                total_quantity += quantity
+                total_quote += quote_quantity
+                if fill["commissionAsset"] == base_asset:
+                    commission += value
+        except (KeyError, TypeError, ValueError) as error:
+            raise PendingIntentError(
+                f"order intent {intent['client_order_id']} returned invalid BUY commission"
+            ) from error
+        if not math.isclose(total_quantity, executed, rel_tol=1e-9, abs_tol=1e-12) or not math.isclose(
+            total_quote, quote, rel_tol=1e-9, abs_tol=1e-12
+        ):
+            raise PendingIntentError(
+                f"order intent {intent['client_order_id']} BUY fill totals are inconsistent"
+            )
+        return executed - commission
+
+    try:
+        trades = client.trades(intent["symbol"], order_id)
+    except (AttributeError, BinanceError, OSError, RuntimeError, ValueError) as error:
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} BUY trades are unavailable"
+        ) from error
+    if not isinstance(trades, list) or not trades:
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} BUY trades are incomplete"
+        )
+    total_quantity = 0.0
+    total_quote = 0.0
+    base_commission = 0.0
+    try:
+        for trade in trades:
+            if (
+                not isinstance(trade, dict)
+                or trade.get("orderId") != order_id
+                or ("symbol" in trade and trade["symbol"] != intent["symbol"])
+            ):
+                raise ValueError("trade identity mismatch")
+            quantity = float(trade["qty"])
+            quote_quantity = float(trade["quoteQty"])
+            commission = float(trade["commission"])
+            if not all(
+                math.isfinite(value) and value >= 0
+                for value in (quantity, quote_quantity, commission)
+            ):
+                raise ValueError("invalid trade quantity")
+            total_quantity += quantity
+            total_quote += quote_quantity
+            if trade.get("commissionAsset") == base_asset:
+                base_commission += commission
+    except (KeyError, TypeError, ValueError) as error:
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} BUY trades are inconsistent"
+        ) from error
+    if not math.isclose(total_quantity, executed, rel_tol=1e-9, abs_tol=1e-12) or not math.isclose(
+        total_quote, quote, rel_tol=1e-9, abs_tol=1e-12
+    ):
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} BUY trade totals are inconsistent"
+        )
+    return executed - base_commission
+
+
+def reconcile_order_intent(
+    client: BinanceClient,
+    intent_path: Path,
+    intent: dict[str, Any],
+    order: dict[str, Any],
+    state_path: Path,
+    history_path: Path,
+    info: dict[str, Any],
+    *,
+    recovered: bool,
+) -> dict[str, Any] | None:
+    order_id, status, executed, quote = validate_reconciled_order(intent, order)
+
+    terminal = status in TERMINAL_ORDER_STATUSES
+    kind = intent["kind"]
+    if kind == "market_buy":
+        if executed > 0 and quote > 0:
+            owned = recovered_buy_quantity(
+                client,
+                intent,
+                order,
+                order_id,
+                executed,
+                quote,
+                info["baseAsset"],
+            )
+            if not math.isfinite(owned) or owned <= 0 or owned > executed:
+                raise PendingIntentError(
+                    f"order intent {intent['client_order_id']} returned invalid net BUY quantity"
+                )
+            step = filter_value(info, "LOT_SIZE", "stepSize") or "0"
+            quantity = floor_to_step(owned, step)
+            if quantity <= 0:
+                quantity = owned
+            record_trade_fill(
+                history_path,
+                intent["symbol"],
+                intent["network"],
+                order,
+                "BUY",
+                intent["source"],
+                tuple(intent["reasons"]),
+                intent["signal_candle_close_time_ms"],
+            )
+            save_position(
+                state_path,
+                Position(intent["symbol"], quantity, quote / executed),
+            )
+        elif terminal:
+            save_position(state_path, None)
+    elif kind in {"strategy_sell", "protective_market_sell"}:
+        initial_quantity = float(intent["position_quantity"])
+        remaining = max(0.0, initial_quantity - executed)
+        minimum = float(filter_value(info, "LOT_SIZE", "minQty") or 0)
+        updated = (
+            Position(
+                intent["symbol"],
+                remaining,
+                float(intent["entry_price"]),
+                None,
+                intent["prior_stop_price"],
+            )
+            if remaining >= minimum and remaining > 0
+            else None
+        )
+        if executed > 0 and quote > 0:
+            record_trade_fill(
+                history_path,
+                intent["symbol"],
+                intent["network"],
+                order,
+                "SELL",
+                intent["source"],
+                tuple(intent["reasons"]),
+                intent["signal_candle_close_time_ms"],
+            )
+        save_position(state_path, updated)
+    else:
+        initial_quantity = float(intent["position_quantity"])
+        if status in {"NEW", "PENDING_NEW", "PARTIALLY_FILLED"}:
+            if executed > 0 and quote > 0:
+                try:
+                    record_trade_fill(
+                        history_path,
+                        intent["symbol"],
+                        intent["network"],
+                        order,
+                        "SELL",
+                        "hosted_stop_loss",
+                        tuple(intent["reasons"]),
+                    )
+                except (OSError, RuntimeError) as error:
+                    raise TradeJournalError(
+                        f"hosted stop fill could not be recorded in {history_path}; "
+                        f"trading stopped: {error}"
+                    ) from error
+            save_position(
+                state_path,
+                Position(
+                    intent["symbol"],
+                    initial_quantity,
+                    float(intent["entry_price"]),
+                    order_id,
+                    float(intent["stop_price"]),
+                ),
+            )
+            clear_order_intent(intent_path)
+            LOGGER.info(
+                "%s intent %s client_order_id=%s status=%s",
+                intent["symbol"],
+                "reconciled/recovered" if recovered else "reconciled",
+                intent["client_order_id"],
+                status,
+            )
+            return order
+        if not terminal:
+            LOGGER.warning(
+                "%s intent pending client_order_id=%s status=%s",
+                intent["symbol"],
+                intent["client_order_id"],
+                status,
+            )
+            raise PendingIntentError(
+                f"order intent {intent['client_order_id']} remains {status}"
+            )
+        if executed == 0:
+            clear_order_intent(intent_path)
+            LOGGER.error(
+                "%s intent failed client_order_id=%s status=%s with zero fill",
+                intent["symbol"],
+                intent["client_order_id"],
+                status,
+            )
+            return None
+        remaining = max(0.0, initial_quantity - executed)
+        minimum = float(filter_value(info, "LOT_SIZE", "minQty") or 0)
+        if executed > 0 and quote > 0:
+            try:
+                record_trade_fill(
+                    history_path,
+                    intent["symbol"],
+                    intent["network"],
+                    order,
+                    "SELL",
+                    "hosted_stop_loss",
+                    tuple(intent["reasons"]),
+                )
+            except (OSError, RuntimeError) as error:
+                raise TradeJournalError(
+                    f"hosted stop fill could not be recorded in {history_path}; "
+                    f"trading stopped: {error}"
+                ) from error
+        save_position(
+            state_path,
+            Position(
+                intent["symbol"],
+                remaining,
+                float(intent["entry_price"]),
+                None,
+                intent["prior_stop_price"],
+            )
+            if remaining >= minimum and remaining > 0
+            else None,
+        )
+        if remaining > 0:
+            clear_order_intent(intent_path)
+            LOGGER.error(
+                "%s intent failed client_order_id=%s status=%s after partial execution; "
+                "remaining position requires protection",
+                intent["symbol"],
+                intent["client_order_id"],
+                status,
+            )
+            return None
+
+    if not terminal:
+        LOGGER.warning(
+            "%s intent pending client_order_id=%s status=%s",
+            intent["symbol"],
+            intent["client_order_id"],
+            status,
+        )
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} remains {status}"
+        )
+
+    clear_order_intent(intent_path)
+    if executed == 0:
+        LOGGER.error(
+            "%s intent failed client_order_id=%s status=%s with zero fill",
+            intent["symbol"],
+            intent["client_order_id"],
+            status,
+        )
+    else:
+        LOGGER.info(
+            "%s intent %s client_order_id=%s status=%s",
+            intent["symbol"],
+            "reconciled/recovered" if recovered else "reconciled",
+            intent["client_order_id"],
+            status,
+        )
+    return order
+
+
+def resolve_order_intent(
+    client: BinanceClient,
+    intent_path: Path,
+    state_path: Path,
+    history_path: Path,
+    symbol: str,
+    network: str,
+    info: dict[str, Any],
+    *,
+    allow_submit: bool = True,
+) -> dict[str, Any] | None:
+    intent = load_order_intent(intent_path, symbol, network)
+    if intent is None:
+        return None
+    current_fingerprint = client_credential_fingerprint(client)
+    if intent["credential_fingerprint"] != current_fingerprint:
+        raise RuntimeError(
+            f"Order intent {intent['client_order_id']} belongs to different Binance credentials"
+        )
+    order = query_intended_order(client, intent)
+    if order is not None:
+        return reconcile_order_intent(
+            client,
+            intent_path,
+            intent,
+            order,
+            state_path,
+            history_path,
+            info,
+            recovered=True,
+        )
+    if intent["submission_attempted"]:
+        LOGGER.warning(
+            "%s intent pending client_order_id=%s: prior submission may have reached Binance",
+            symbol,
+            intent["client_order_id"],
+        )
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} was attempted and is query-only"
+        )
+    if not allow_submit:
+        LOGGER.warning(
+            "%s intent pending client_order_id=%s: execution is disabled",
+            symbol,
+            intent["client_order_id"],
+        )
+        raise PendingIntentError(
+            f"order intent {intent['client_order_id']} is unresolved while execution is disabled"
+        )
+    if intent["cancel_order_id"] is not None:
+        if not finish_cancel_prerequisite(
+            client, intent_path, intent, state_path, history_path, info
+        ):
+            return None
+        intent = load_order_intent(intent_path, symbol, network)
+        if intent is None:
+            return None
+        order = query_intended_order(client, intent)
+        if order is not None:
+            return reconcile_order_intent(
+                client,
+                intent_path,
+                intent,
+                order,
+                state_path,
+                history_path,
+                info,
+                recovered=True,
+            )
+    intent["submission_attempted"] = True
+    save_order_intent(intent_path, intent)
+    LOGGER.info(
+        "%s intent submitted client_order_id=%s kind=%s",
+        symbol,
+        intent["client_order_id"],
+        intent["kind"],
+    )
+    try:
+        if intent["kind"] == "market_buy":
+            order = client.market_buy(
+                symbol, float(intent["quote_quantity"]), intent["client_order_id"]
+            )
+        elif intent["kind"] in {"strategy_sell", "protective_market_sell"}:
+            order = client.market_sell(
+                symbol, float(intent["quantity"]), intent["client_order_id"]
+            )
+        else:
+            order = client.place_stop_loss(
+                symbol,
+                float(intent["quantity"]),
+                float(intent["stop_price"]),
+                intent["client_order_id"],
+            )
+    except BinanceError as error:
+        if not error.ambiguous:
+            clear_order_intent(intent_path)
+            LOGGER.error(
+                "%s intent failed client_order_id=%s: %s",
+                symbol,
+                intent["client_order_id"],
+                error,
+            )
+            raise
+        order = query_intended_order(client, intent)
+        if order is None:
+            LOGGER.warning(
+                "%s intent pending client_order_id=%s after ambiguous submission",
+                symbol,
+                intent["client_order_id"],
+            )
+            raise PendingIntentError(
+                f"order intent {intent['client_order_id']} submission is unresolved"
+            ) from error
+        return reconcile_order_intent(
+            client,
+            intent_path,
+            intent,
+            order,
+            state_path,
+            history_path,
+            info,
+            recovered=True,
+        )
+    return reconcile_order_intent(
+        client,
+        intent_path,
+        intent,
+        order,
+        state_path,
+        history_path,
+        info,
+        recovered=False,
+    )
+
+
+def execute_prepared_intent(
+    client: BinanceClient,
+    intent_path: Path,
+    state_path: Path,
+    history_path: Path,
+    info: dict[str, Any],
+    intent: dict[str, Any],
+) -> dict[str, Any] | None:
+    return resolve_order_intent(
+        client,
+        intent_path,
+        state_path,
+        history_path,
+        intent["symbol"],
+        intent["network"],
+        info,
+    )
+
+
+def execute_protective_market_exit(
+    client: BinanceClient,
+    args: argparse.Namespace,
+    info: dict[str, Any],
+    position: Position,
+    history_path: Path,
+    network: str,
+    reason: str,
+) -> Position | None:
+    state_path = Path(args.state_file)
+    intent_path = order_intent_path(state_path, args.symbol, network)
+    reference_price = client.ticker_price(args.symbol)
+    available = min(position.quantity, client.free_balance(info["baseAsset"]))
+    quantity = market_sell_quantity(available, reference_price, info)
+    intent = prepare_order_intent(
+        intent_path,
+        args.symbol,
+        network,
+        "protective_market_sell",
+        "protective_market",
+        (reason,),
+        quantity=quantity,
+        position=position,
+    )
+    result = execute_prepared_intent(
+        client, intent_path, state_path, history_path, info, intent
+    )
+    if result is None:
+        return load_position(state_path, args.symbol)
+    sold = float(result["executedQty"])
+    received = float(result["cummulativeQuoteQty"])
+    if not all(math.isfinite(value) and value > 0 for value in (sold, received)):
+        raise BinanceError(f"Protective market sell did not fill: {result}")
+    average_price = received / sold
+    gross_pnl = (average_price - position.entry_price) * sold
+    LOGGER.critical(
+        "%s SELL protective_market order_id=%s quantity=%.8f average=%.8f "
+        "gross_pnl=%.8f %s reason=%s",
+        args.symbol,
+        result["orderId"],
+        sold,
+        average_price,
+        gross_pnl,
+        info["quoteAsset"],
+        reason,
+    )
+    return load_position(state_path, args.symbol)
+
+
+def ensure_hosted_stop(
+    client: BinanceClient,
+    args: argparse.Namespace,
+    config: StrategyConfig,
+    info: dict[str, Any],
+    position: Position,
+    history_path: Path,
+    network: str,
+    closed_price: float,
+) -> tuple[Position | None, bool]:
+    if position.stop_order_id is not None or not args.hosted_stop_loss or config.stop_loss_pct <= 0:
+        return position, False
+    desired_stop = trailing_stop_price(
+        position.entry_price,
+        closed_price,
+        config.stop_loss_pct,
+        config.trailing_thresholds,
+    )
+    desired_stop = max(desired_stop, position.stop_price or 0.0)
+    available = min(position.quantity, client.free_balance(info["baseAsset"]))
+    stop_quantity, desired_stop = stop_order_values(available, desired_stop, info)
+    live_price = client.ticker_price(args.symbol)
+    if live_price <= desired_stop:
+        updated = execute_protective_market_exit(
+            client,
+            args,
+            info,
+            position,
+            history_path,
+            network,
+            f"missing hosted stop with live price {live_price:.8f} at/below {desired_stop:.8f}",
+        )
+        return updated, True
+    state_path = Path(args.state_file)
+    intent_path = order_intent_path(state_path, args.symbol, network)
+    intent = prepare_order_intent(
+        intent_path,
+        args.symbol,
+        network,
+        "hosted_stop",
+        "hosted_stop_loss",
+        ("place or restore hosted stop-loss",),
+        quantity=stop_quantity,
+        stop_price=desired_stop,
+        position=position,
+    )
+    try:
+        stop_order = execute_prepared_intent(
+            client, intent_path, state_path, history_path, info, intent
+        )
+    except BinanceError as error:
+        if load_order_intent(intent_path, args.symbol, network) is not None:
+            raise
+        updated = load_position(state_path, args.symbol)
+        if updated is None:
+            return None, True
+        protected = execute_protective_market_exit(
+            client,
+            args,
+            info,
+            updated,
+            history_path,
+            network,
+            f"hosted stop placement was definitively rejected: {error}",
+        )
+        return protected, True
+    updated = load_position(state_path, args.symbol)
+    if stop_order is None:
+        if updated is None:
+            return None, True
+        protected = execute_protective_market_exit(
+            client,
+            args,
+            info,
+            updated,
+            history_path,
+            network,
+            "hosted stop placement terminated without protecting the remaining position",
+        )
+        return protected, True
+    if updated is None:
+        return updated, updated is None
+    LOGGER.warning(
+        "%s restored missing hosted stop order %s at %.8f",
+        args.symbol,
+        stop_order["orderId"],
+        desired_stop,
+    )
+    return updated, False
+
+
+def tighten_hosted_stop(
+    client: BinanceClient,
+    args: argparse.Namespace,
+    config: StrategyConfig,
+    closed_price: float,
+    info: dict[str, Any],
+    position: Position,
+    stop_order: dict[str, Any],
+    history_path: Path,
+    network: str,
+) -> Position | None:
+    profit_pct = (closed_price / position.entry_price - 1) * 100
+    if not any(profit_pct >= trigger for trigger, _ in config.trailing_thresholds):
+        return position
+    desired_price = trailing_stop_price(
+        position.entry_price,
+        closed_price,
+        config.stop_loss_pct,
+        config.trailing_thresholds,
+    )
+    _, desired_price = stop_order_values(position.quantity, desired_price, info)
+    current_stop = position.stop_price or 0.0
+    if desired_price <= current_stop:
+        return position
+
+    live_price = client.ticker_price(args.symbol)
+    if live_price <= desired_price:
+        LOGGER.warning(
+            "%s HOLD trailing stop not changed: live price %.8f is at/below target %.8f",
+            args.symbol,
+            live_price,
+            desired_price,
+        )
+        return position
+
+    state_path = Path(args.state_file)
+    intent_path = order_intent_path(state_path, args.symbol, network)
+    intent = prepare_order_intent(
+        intent_path,
+        args.symbol,
+        network,
+        "hosted_stop",
+        "hosted_stop_loss",
+        ("replace hosted stop-loss with tighter trailing stop",),
+        quantity=position.quantity,
+        stop_price=desired_price,
+        position=position,
+        cancel_order_id=position.stop_order_id,
+    )
+    try:
+        replacement = execute_prepared_intent(
+            client, intent_path, state_path, history_path, info, intent
+        )
+    except BinanceError as replacement_error:
+        if load_order_intent(intent_path, args.symbol, network) is not None:
+            raise PendingIntentError(
+                f"trailing stop intent {intent['client_order_id']} remains unresolved"
+            ) from replacement_error
+        replacement = None
+        LOGGER.error("Trailing stop replacement was rejected: %s", replacement_error)
+    updated = load_position(state_path, args.symbol)
+    if replacement is None:
+        if updated is None:
+            return None
+        if current_stop > 0 and client.ticker_price(args.symbol) > current_stop:
+            try:
+                available = min(updated.quantity, client.free_balance(info["baseAsset"]))
+                restored_quantity, restored_price = stop_order_values(
+                    available, current_stop, info
+                )
+                restore_intent = prepare_order_intent(
+                    intent_path,
+                    args.symbol,
+                    network,
+                    "hosted_stop",
+                    "hosted_stop_loss",
+                    ("restore prior stop after trailing replacement failed",),
+                    quantity=restored_quantity,
+                    stop_price=restored_price,
+                    position=updated,
+                )
+                restored = execute_prepared_intent(
+                    client,
+                    intent_path,
+                    state_path,
+                    history_path,
+                    info,
+                    restore_intent,
+                )
+                if restored is None:
+                    raise BinanceError("Prior hosted stop restoration failed with no fill")
+            except (BinanceError, ValueError) as restore_error:
+                remaining_position = load_position(state_path, args.symbol)
+                if remaining_position is None:
+                    return None
+                return execute_protective_market_exit(
+                    client,
+                    args,
+                    info,
+                    remaining_position,
+                    history_path,
+                    network,
+                    "trailing stop replacement and prior-stop restoration failed: "
+                    f"{restore_error}",
+                )
+            restored_position = load_position(state_path, args.symbol)
+            LOGGER.warning(
+                "%s HOLD tighter stop %.8f was rejected; restored stop %.8f",
+                args.symbol,
+                desired_price,
+                restored_price,
+            )
+            return restored_position
+        return execute_protective_market_exit(
+            client,
+            args,
+            info,
+            updated,
+            history_path,
+            network,
+            "trailing stop replacement failed and prior stop cannot be restored",
+        )
+    updated = load_position(state_path, args.symbol)
+    protected_pct = (desired_price / position.entry_price - 1) * 100
+    LOGGER.info(
+        "%s TRAIL stop moved %.8f -> %.8f, protecting %.3f%%",
+        args.symbol,
+        current_stop,
+        desired_price,
+        protected_pct,
+    )
+    return updated
 
 
 def execute_cycle(
@@ -430,28 +2297,95 @@ def execute_cycle(
     info: dict[str, Any],
 ) -> Decision:
     state_path = Path(args.state_file)
+    network = "mainnet" if args.live else "testnet"
+    history_path = trade_history_path(state_path, args.symbol, network)
+    intent_path = order_intent_path(state_path, args.symbol, network)
+    intent_existed_at_start = load_order_intent(intent_path, args.symbol, network) is not None
+    resolve_order_intent(
+        client,
+        intent_path,
+        state_path,
+        history_path,
+        args.symbol,
+        network,
+        info,
+        allow_submit=args.execute,
+    )
     position = load_position(state_path, args.symbol)
-    # Fetch one active candle to discard and one extra closed candle for crossover detection.
-    limit = max(config.slow_sma + 1, config.rsi_period + 1) + 1
-    closes = client.closes(args.symbol, args.interval, limit)
+    # Fetch one active candle to discard; every signal and trailing update uses only closed candles.
+    limit = (
+        max(
+            config.slow_sma + config.buy_crossover_lookback_candles,
+            config.rsi_period + 1,
+            config.cooldown_candles + 1,
+        )
+        + 1
+    )
+    if hasattr(client, "candles"):
+        candles = client.candles(args.symbol, args.interval, limit)
+    else:
+        prices = client.closes(args.symbol, args.interval, limit)
+        candles = [Candle(close, index) for index, close in enumerate(prices)]
+    closed_candles = candles[:-1]
+    closes = [candle.close for candle in closed_candles]
+    if not closed_candles:
+        raise BinanceError("Binance returned no closed candles")
+    latest_close_time_ms = closed_candles[-1].close_time_ms
     hosted_stop_filled = False
     hosted_stop_order: dict[str, Any] | None = None
     hosted_stop_executed = 0.0
 
+    if args.execute and position is not None and position.stop_order_id is None:
+        position, hosted_stop_filled = ensure_hosted_stop(
+            client,
+            args,
+            config,
+            info,
+            position,
+            history_path,
+            network,
+            closes[-1],
+        )
+
     if args.execute and position is not None and position.stop_order_id is not None:
         stop_order = client.order(args.symbol, position.stop_order_id)
-        hosted_stop_executed = float(stop_order.get("executedQty", 0))
-        if stop_order["status"] == "FILLED" or hosted_stop_executed >= position.quantity:
+        stop_status, hosted_stop_executed, _ = validate_hosted_stop_order(
+            stop_order, position
+        )
+        if hosted_stop_executed > 0:
+            stop_reason = (
+                "hosted stop-loss order filled"
+                if stop_status == "FILLED"
+                else "hosted stop-loss order partially filled"
+            )
+            record_and_log_hosted_fill(
+                history_path,
+                args.symbol,
+                network,
+                stop_order,
+                (stop_reason,),
+                position.entry_price,
+                info["quoteAsset"],
+            )
+        if stop_status == "FILLED" or hosted_stop_executed >= position.quantity:
             save_position(state_path, None)
             position = None
             hosted_stop_filled = True
             LOGGER.info("Hosted stop-loss order %s filled; local position cleared", stop_order["orderId"])
-        elif stop_order["status"] in {"NEW", "PENDING_NEW", "PARTIALLY_FILLED"}:
+        elif stop_status in {"NEW", "PENDING_NEW", "PARTIALLY_FILLED"}:
             hosted_stop_order = stop_order
         else:
             remaining = max(0.0, position.quantity - hosted_stop_executed)
             position = (
-                Position(position.symbol, remaining, position.entry_price) if remaining > 0 else None
+                Position(
+                    position.symbol,
+                    remaining,
+                    position.entry_price,
+                    None,
+                    position.stop_price,
+                )
+                if remaining > 0
+                else None
             )
             save_position(state_path, position)
             if position is None:
@@ -460,12 +2394,47 @@ def execute_cycle(
                 "Hosted stop-loss order %s is %s after filling %.8f; "
                 "saved the remaining position without the inactive stop",
                 stop_order["orderId"],
-                stop_order["status"],
+                stop_status,
                 hosted_stop_executed,
             )
+            if position is not None:
+                position, protective_exit = ensure_hosted_stop(
+                    client,
+                    args,
+                    config,
+                    info,
+                    position,
+                    history_path,
+                    network,
+                    closes[-1],
+                )
+                hosted_stop_filled = hosted_stop_filled or protective_exit
+                if position is not None and position.stop_order_id is not None:
+                    hosted_stop_order = {
+                        "orderId": position.stop_order_id,
+                        "status": "NEW",
+                        "origQty": decimal_string(position.quantity),
+                        "executedQty": "0",
+                    }
 
-    decision = decide(closes[:-1], config, position)
-    if hosted_stop_filled:
+    required_prices = max(config.slow_sma + 1, config.rsi_period + 1)
+    if len(closes) < required_prices:
+        raise InsufficientMarketData(
+            f"Waiting for market history: Binance returned {len(closes)} completed "
+            f"{args.interval} candle(s) for {args.symbol}; {required_prices} required"
+        )
+
+    decision = decide(closes, config, position)
+    if intent_existed_at_start:
+        decision = Decision(
+            "HOLD",
+            ("recovered prior order intent; strategy deferred for this cycle",),
+            decision.price,
+            decision.fast_sma,
+            decision.slow_sma,
+            decision.rsi,
+        )
+    elif hosted_stop_filled:
         decision = Decision(
             "HOLD",
             ("hosted stop-loss filled during this cycle",),
@@ -474,6 +2443,22 @@ def execute_cycle(
             decision.slow_sma,
             decision.rsi,
         )
+
+    if decision.action == "BUY":
+        cooldown_reason = buy_cooldown_reason(
+            load_trade_history(history_path, args.symbol, network),
+            closed_candles,
+            config.cooldown_candles,
+        )
+        if cooldown_reason is not None:
+            decision = Decision(
+                "HOLD",
+                (cooldown_reason,),
+                decision.price,
+                decision.fast_sma,
+                decision.slow_sma,
+                decision.rsi,
+            )
 
     sell_quantity: float | None = None
     sell_reference_price: float | None = None
@@ -513,6 +2498,24 @@ def execute_cycle(
     if decision.action == "HOLD" or not args.execute:
         if decision.action != "HOLD":
             LOGGER.warning("Dry run: order not submitted; add --execute to enable orders")
+        if (
+            args.execute
+            and position is not None
+            and hosted_stop_order is not None
+            and args.hosted_stop_loss
+            and config.stop_loss_pct > 0
+        ):
+            tighten_hosted_stop(
+                client,
+                args,
+                config,
+                decision.price,
+                info,
+                position,
+                hosted_stop_order,
+                history_path,
+                network,
+            )
         return decision
 
     if decision.action == "BUY":
@@ -532,16 +2535,40 @@ def execute_cycle(
             estimated_exit_price,
             info,
         )
-        result = client.market_buy(args.symbol, args.quote_size)
+        intent = prepare_order_intent(
+            intent_path,
+            args.symbol,
+            network,
+            "market_buy",
+            "strategy",
+            decision.reasons,
+            quote_quantity=args.quote_size,
+            signal_candle_close_time_ms=latest_close_time_ms,
+        )
+        result = execute_prepared_intent(
+            client, intent_path, state_path, history_path, info, intent
+        )
+        if result is None:
+            return decision
         quantity = float(result["executedQty"])
         spent = float(result["cummulativeQuoteQty"])
-        if quantity <= 0:
+        if not all(math.isfinite(value) and value > 0 for value in (quantity, spent)):
             raise BinanceError(f"Buy order did not fill: {result}")
-        new_position = Position(args.symbol, quantity, spent / quantity)
-        save_position(state_path, new_position)
-        LOGGER.info("Bought %.8f %s at average %.8f", quantity, info["baseAsset"], new_position.entry_price)
-        owned_quantity = net_base_quantity(result, info["baseAsset"])
-        available = min(owned_quantity, client.free_balance(info["baseAsset"]))
+        new_position = load_position(state_path, args.symbol)
+        if new_position is None:
+            raise RuntimeError("filled BUY was reconciled without a local position")
+        LOGGER.info(
+            "%s BUY filled order_id=%s quantity=%.8f %s average=%.8f spent=%.8f %s reason=%s",
+            args.symbol,
+            result["orderId"],
+            quantity,
+            info["baseAsset"],
+            new_position.entry_price,
+            spent,
+            info["quoteAsset"],
+            "; ".join(decision.reasons),
+        )
+        available = min(new_position.quantity, client.free_balance(info["baseAsset"]))
         reconciled_exit_price = new_position.entry_price * (
             1 - config.stop_loss_pct / 100 if config.stop_loss_pct > 0 else 1
         )
@@ -558,11 +2585,17 @@ def execute_cycle(
         new_position = Position(args.symbol, sellable_quantity, new_position.entry_price)
         save_position(state_path, new_position)
         if args.hosted_stop_loss and config.stop_loss_pct > 0:
-            stop_quantity, stop_price = protective_stop_values(
-                available, new_position.entry_price, config.stop_loss_pct, info
-            )
             try:
-                stop_order = client.place_stop_loss(args.symbol, stop_quantity, stop_price)
+                new_position, _ = ensure_hosted_stop(
+                    client,
+                    args,
+                    config,
+                    info,
+                    new_position,
+                    history_path,
+                    network,
+                    decision.price,
+                )
             except BinanceError as error:
                 LOGGER.critical(
                     "Buy filled but hosted stop placement failed; position remains in %s: %s",
@@ -570,64 +2603,91 @@ def execute_cycle(
                     error,
                 )
                 raise
-            new_position = Position(
-                args.symbol,
-                stop_quantity,
-                new_position.entry_price,
-                int(stop_order["orderId"]),
-                stop_price,
-            )
-            save_position(state_path, new_position)
+            if new_position is None:
+                return decision
             LOGGER.info(
                 "Hosted stop-loss order %s placed: sell %.8f %s if price reaches %.8f",
-                stop_order["orderId"],
-                stop_quantity,
+                new_position.stop_order_id,
+                new_position.quantity,
                 info["baseAsset"],
-                stop_price,
+                new_position.stop_price,
             )
         return decision
 
     assert position is not None
-    remaining_before_market = position.quantity
-    if position.stop_order_id is not None:
-        canceled = client.cancel_order(args.symbol, position.stop_order_id)
-        LOGGER.info("Canceled hosted stop-loss order %s before strategy exit", canceled["orderId"])
-        canceled_executed = float(canceled.get("executedQty", hosted_stop_executed))
-        remaining_before_market = max(0.0, position.quantity - canceled_executed)
-        position = (
-            Position(position.symbol, remaining_before_market, position.entry_price)
-            if remaining_before_market > 0
-            else None
-        )
-        save_position(state_path, position)
-        if position is None:
-            LOGGER.info("Hosted stop filled while cancellation was being processed; state cleared")
-            return decision
-        available = min(remaining_before_market, client.free_balance(info["baseAsset"]))
-        assert sell_reference_price is not None
-        try:
-            sell_quantity = market_sell_quantity(available, sell_reference_price, info)
-        except ValueError as error:
-            raise BinanceError(
-                f"hosted stop was canceled but the released quantity cannot be sold: {error}"
-            ) from error
+    entry_price = position.entry_price
     assert sell_quantity is not None
-    result = client.market_sell(args.symbol, sell_quantity)
-    sold = float(result["executedQty"])
-    remaining = max(0.0, remaining_before_market - sold)
-    minimum = float(filter_value(info, "LOT_SIZE", "minQty") or 0)
-    save_position(
-        state_path,
-        Position(position.symbol, remaining, position.entry_price) if remaining >= minimum else None,
+    intent = prepare_order_intent(
+        intent_path,
+        args.symbol,
+        network,
+        "strategy_sell",
+        "strategy",
+        decision.reasons,
+        quantity=sell_quantity,
+        position=position,
+        signal_candle_close_time_ms=latest_close_time_ms,
+        cancel_order_id=position.stop_order_id,
     )
-    LOGGER.info("Sold %.8f %s", sold, info["baseAsset"])
+    result = execute_prepared_intent(
+        client, intent_path, state_path, history_path, info, intent
+    )
+    if result is None:
+        position = load_position(state_path, args.symbol)
+        if position is not None and position.stop_order_id is None:
+            try:
+                position, protective_exit = ensure_hosted_stop(
+                    client,
+                    args,
+                    config,
+                    info,
+                    position,
+                    history_path,
+                    network,
+                    decision.price,
+                )
+            except (BinanceError, ValueError) as error:
+                raise BinanceError(
+                    "hosted stop was canceled but the changed position could not be sold "
+                    f"or protected: {error}"
+                ) from error
+            if protective_exit:
+                return decision
+        return Decision(
+            "HOLD",
+            ("SELL canceled because its cancellation prerequisite consumed or changed the position",),
+            decision.price,
+            decision.fast_sma,
+            decision.slow_sma,
+            decision.rsi,
+        )
+    sold = float(result["executedQty"])
+    received = float(result["cummulativeQuoteQty"])
+    if not all(math.isfinite(value) and value > 0 for value in (sold, received)):
+        raise BinanceError(f"Sell order did not fill: {result}")
+    average_price = received / sold
+    gross_pnl = (average_price - entry_price) * sold
+    gross_pnl_pct = (average_price / entry_price - 1) * 100
+    LOGGER.info(
+        "%s SELL filled order_id=%s quantity=%.8f %s average=%.8f gross_pnl=%.8f %s "
+        "(%.3f%%) reason=%s",
+        args.symbol,
+        result["orderId"],
+        sold,
+        info["baseAsset"],
+        average_price,
+        gross_pnl,
+        info["quoteAsset"],
+        gross_pnl_pct,
+        "; ".join(decision.reasons),
+    )
     return decision
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Rule-based Binance Spot trading bot")
     parser.add_argument("--symbol", default="BTCUSDT", help="Binance pair (default: BTCUSDT)")
-    parser.add_argument("--interval", default="1m", help="Candle interval (default: 1m)")
+    parser.add_argument("--interval", default="15m", help="Candle interval (default: 15m)")
     parser.add_argument("--poll-seconds", type=float, default=60, help="Seconds between decisions")
     parser.add_argument("--once", action="store_true", help="Run one decision cycle and exit")
     parser.add_argument("--execute", action="store_true", help="Submit orders; otherwise dry-run")
@@ -646,13 +2706,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--buy-on-bullish-trend",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Require fast SMA to cross above slow SMA for entry (default: enabled)",
+        help="Require a strong rising bullish SMA crossover (default: enabled)",
     )
     parser.add_argument(
         "--sell-on-bearish-trend",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Exit when fast SMA crosses below slow SMA (default: enabled)",
+        help="Exit on a strong bearish SMA trend with a falling slow SMA (default: enabled)",
     )
     parser.add_argument("--buy-below", type=float, help="Require market price at or below this value")
     parser.add_argument("--sell-above", type=float, help="Exit at or above this market price")
@@ -661,25 +2721,87 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-loss-pct", type=float, default=2.0, help="0 disables (default: 2)")
     parser.add_argument("--take-profit-pct", type=float, default=4.0, help="0 disables (default: 4)")
     parser.add_argument(
+        "--min-sma-gap-pct",
+        type=float,
+        default=0.1,
+        help="Minimum bullish/bearish SMA separation in percent (default: 0.10)",
+    )
+    parser.add_argument(
+        "--buy-crossover-lookback-candles",
+        type=int,
+        default=3,
+        help="Closed candles allowed for SMA crossover confirmation (default: 3)",
+    )
+    parser.add_argument("--buy-rsi-min", type=float, default=50.0, help="Minimum entry RSI")
+    parser.add_argument("--buy-rsi-max", type=float, default=70.0, help="Maximum entry RSI")
+    parser.add_argument(
+        "--cooldown-candles",
+        type=int,
+        default=3,
+        help="Closed candles to block entries after a strategy sell (default: 3)",
+    )
+    parser.add_argument(
+        "--trailing-thresholds",
+        type=parse_trailing_thresholds,
+        default=parse_trailing_thresholds("1:0,2:1,3:2"),
+        metavar="TRIGGER:PROTECTED,...",
+        help="Profit trigger and protected-profit percentages (default: 1:0,2:1,3:2)",
+    )
+    parser.add_argument(
         "--hosted-stop-loss",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Place the stop at Binance after a filled buy (default: enabled)",
     )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--log-file",
+        help="Operational log path (default: trader-<SYMBOL>-<network>.log beside state)",
+    )
     return parser
+
+
+def configure_logging(verbose: bool, log_file: str | None) -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        path = Path(log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+            )
+        )
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+        force=True,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.symbol = args.symbol.upper()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    network = "mainnet" if args.live else "testnet"
+    if args.log_file is None:
+        args.log_file = str(
+            operational_log_path(Path(args.state_file), args.symbol, network)
+        )
+    lock_handle = None
     try:
+        configure_logging(args.verbose, args.log_file)
         validate_args(args)
+        lock_handle = acquire_process_lock(args.symbol, network)
+        LOGGER.info("Process lock acquired for %s on %s", args.symbol, network)
+        history_path = trade_history_path(Path(args.state_file), args.symbol, network)
+        initialize_trade_history(history_path, args.symbol, network)
+        LOGGER.info("Trade history: %s", history_path)
+        LOGGER.info(
+            "BUY/SELL operations log: %s",
+            trade_operations_log_path(Path(args.state_file), args.symbol, network),
+        )
+        LOGGER.info("Operational log: %s", args.log_file)
         config = StrategyConfig(
             fast_sma=args.fast_sma,
             slow_sma=args.slow_sma,
@@ -692,6 +2814,12 @@ def main(argv: list[str] | None = None) -> int:
             sell_rsi_above=args.sell_rsi_above,
             stop_loss_pct=args.stop_loss_pct,
             take_profit_pct=args.take_profit_pct,
+            min_sma_gap_pct=args.min_sma_gap_pct,
+            buy_crossover_lookback_candles=args.buy_crossover_lookback_candles,
+            buy_rsi_min=args.buy_rsi_min,
+            buy_rsi_max=args.buy_rsi_max,
+            cooldown_candles=args.cooldown_candles,
+            trailing_thresholds=args.trailing_thresholds,
         )
         client = BinanceClient(
             MAINNET_URL if args.live else TESTNET_URL,
@@ -707,17 +2835,27 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             try:
                 execute_cycle(client, args, config, info)
-            except (BinanceError, RuntimeError, ValueError) as error:
+            except TradeJournalError as error:
+                LOGGER.critical("%s", error)
+                return 1
+            except InsufficientMarketData as error:
+                LOGGER.warning("%s", error)
+                if args.once:
+                    return 1
+            except (BinanceError, OSError, RuntimeError, ValueError) as error:
                 LOGGER.error("Cycle failed: %s", error)
                 if args.once:
                     return 1
             if args.once:
                 return 0
             time.sleep(args.poll_seconds)
-    except (BinanceError, RuntimeError, ValueError) as error:
+    except (BinanceError, OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))
     except KeyboardInterrupt:
         LOGGER.info("Stopped")
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
     return 0
 
 
