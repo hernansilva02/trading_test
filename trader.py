@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +114,7 @@ class StrategyConfig:
     buy_rsi_min: float = 50.0
     buy_rsi_max: float = 70.0
     cooldown_candles: int = 3
+    stop_cooldown_candles: int = 6
     trailing_thresholds: tuple[tuple[float, float], ...] = (
         (1.0, 0.0),
         (2.0, 1.0),
@@ -324,7 +325,7 @@ class BinanceClient:
         return self._request(
             "GET",
             "/api/v3/myTrades",
-            {"symbol": symbol, "orderId": order_id},
+            {"symbol": symbol, "orderId": order_id, "limit": 1000},
             signed=True,
         )
 
@@ -338,13 +339,17 @@ def decimal_string(value: float) -> str:
     return format(Decimal(str(value)), "f")
 
 
-def floor_to_step(value: float, step: str) -> float:
+def floor_to_step(value: float | Decimal, step: str) -> float:
     decimal_value = Decimal(str(value))
     decimal_step = Decimal(step)
     if decimal_step == 0:
         return value
     units = (decimal_value / decimal_step).to_integral_value(rounding=ROUND_DOWN)
     return float(units * decimal_step)
+
+
+def remaining_quantity(original: float, executed: float) -> float:
+    return float(max(Decimal(0), Decimal(str(original)) - Decimal(str(executed))))
 
 
 def simple_rsi(closes: list[float], period: int) -> float:
@@ -359,6 +364,26 @@ def simple_rsi(closes: list[float], period: int) -> float:
         return 100.0
     relative_strength = average_gain / average_loss
     return 100 - (100 / (1 + relative_strength))
+
+
+def latest_bullish_crossover_age(closes: list[float], config: StrategyConfig) -> int | None:
+    available_crossovers = min(
+        config.buy_crossover_lookback_candles,
+        len(closes) - config.slow_sma,
+    )
+    for age in range(available_crossovers):
+        end = len(closes) - age
+        candidate_fast = sum(closes[end - config.fast_sma : end]) / config.fast_sma
+        candidate_slow = sum(closes[end - config.slow_sma : end]) / config.slow_sma
+        candidate_previous_fast = (
+            sum(closes[end - config.fast_sma - 1 : end - 1]) / config.fast_sma
+        )
+        candidate_previous_slow = (
+            sum(closes[end - config.slow_sma - 1 : end - 1]) / config.slow_sma
+        )
+        if candidate_previous_fast <= candidate_previous_slow and candidate_fast > candidate_slow:
+            return age
+    return None
 
 
 def decide(
@@ -377,24 +402,7 @@ def decide(
     slow_slope = slow - previous_slow
     bullish_gap_pct = (fast - slow) / slow * 100
     bearish_gap_pct = (slow - fast) / slow * 100
-    bullish_crossover_age: int | None = None
-    available_crossovers = min(
-        config.buy_crossover_lookback_candles,
-        len(closes) - config.slow_sma,
-    )
-    for age in range(available_crossovers):
-        end = len(closes) - age
-        candidate_fast = sum(closes[end - config.fast_sma : end]) / config.fast_sma
-        candidate_slow = sum(closes[end - config.slow_sma : end]) / config.slow_sma
-        candidate_previous_fast = (
-            sum(closes[end - config.fast_sma - 1 : end - 1]) / config.fast_sma
-        )
-        candidate_previous_slow = (
-            sum(closes[end - config.slow_sma - 1 : end - 1]) / config.slow_sma
-        )
-        if candidate_previous_fast <= candidate_previous_slow and candidate_fast > candidate_slow:
-            bullish_crossover_age = age
-            break
+    bullish_crossover_age = latest_bullish_crossover_age(closes, config)
     bullish_crossover = bullish_crossover_age is not None
     strong_bearish_trend = (
         fast < slow
@@ -758,6 +766,73 @@ def empty_trade_history(symbol: str, network: str) -> dict[str, Any]:
     }
 
 
+def accounting_decimal(value: Any) -> Decimal:
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation as error:
+        raise RuntimeError("Inventory contains an invalid decimal") from error
+    if isinstance(value, bool) or not number.is_finite() or number < 0:
+        raise RuntimeError("Inventory quantities and costs must be finite and non-negative")
+    return number
+
+
+def inventory_snapshot(history: dict[str, Any]) -> dict[str, str]:
+    """Replay cumulative order records, so recovery cannot credit the same dust twice."""
+    opening = history["inventory_opening"]
+    quantity = accounting_decimal(opening["quantity"])
+    cost = accounting_decimal(opening["cost_quote"])
+    base_asset = opening["base_asset"]
+    quote_asset = opening["quote_asset"]
+    for fill in history["fills"][opening["start_index"] :]:
+        fees = fill["commissions"]
+        executed = accounting_decimal(fill.get("executed_quantity", fill["quantity"]))
+        base_fee = accounting_decimal(fees.get(base_asset, "0"))
+        if fill["side"] == "BUY":
+            acquired = executed - base_fee
+            if acquired <= 0:
+                raise RuntimeError("BUY commission consumed the acquired inventory")
+            quantity += acquired
+            quote = accounting_decimal(fill.get("executed_quote_quantity", fill["quote_quantity"]))
+            cost += quote + accounting_decimal(fees.get(quote_asset, "0"))
+        else:
+            consumed = executed + base_fee
+            if consumed > quantity:
+                raise RuntimeError("SELL exceeds the bot-owned inventory ledger")
+            consumed = min(consumed, quantity)
+            cost = cost * (quantity - consumed) / quantity if quantity else Decimal(0)
+            quantity -= consumed
+    step = accounting_decimal(opening["step_size"])
+    tradable = (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step if step else quantity
+    residual = quantity - tradable
+    return {
+        "quantity": format(quantity, "f"),
+        "cost_quote": format(cost, "f"),
+        "residual_quantity": format(residual, "f"),
+        "residual_cost_quote": format(cost * residual / quantity if quantity else Decimal(0), "f"),
+    }
+
+
+def inventory_opening(info: dict[str, Any], position: Position | None, start_index: int) -> dict:
+    quantity = Decimal(str(position.quantity)) if position is not None else Decimal(0)
+    return {
+        "base_asset": info["baseAsset"],
+        "quote_asset": info["quoteAsset"],
+        "step_size": filter_value(info, "LOT_SIZE", "stepSize") or "0",
+        "quantity": format(quantity, "f"),
+        "cost_quote": format(
+            quantity * Decimal(str(position.entry_price)) if position else Decimal(0), "f"
+        ),
+        "start_index": start_index,
+    }
+
+
+def inventory_sellable_quantity(history: dict[str, Any], info: dict[str, Any]) -> float:
+    return floor_to_step(
+        Decimal(history["inventory"]["quantity"]),
+        filter_value(info, "LOT_SIZE", "stepSize") or "0",
+    )
+
+
 def load_trade_history(path: Path, symbol: str, network: str) -> dict[str, Any]:
     if not path.exists():
         return empty_trade_history(symbol, network)
@@ -821,6 +896,45 @@ def load_trade_history(path: Path, symbol: str, network: str) -> dict[str, Any]:
         if fill["order_id"] in seen_order_ids:
             raise RuntimeError(f"Invalid trade history file {path}: duplicate order ID")
         seen_order_ids.add(fill["order_id"])
+        if "commissions" in fill:
+            fees = fill["commissions"]
+            if not isinstance(fees, dict) or not all(
+                isinstance(asset, str) and asset for asset in fees
+            ):
+                raise RuntimeError(f"Invalid trade history file {path}: invalid commissions")
+            for amount in fees.values():
+                accounting_decimal(amount)
+            for exact_key, numeric_key in (
+                ("executed_quantity", "quantity"),
+                ("executed_quote_quantity", "quote_quantity"),
+            ):
+                if exact_key in fill and not math.isclose(
+                    float(accounting_decimal(fill[exact_key])), fill[numeric_key],
+                    rel_tol=1e-12, abs_tol=1e-15,
+                ):
+                    raise RuntimeError(
+                        f"Invalid trade history file {path}: inconsistent exact execution quantities"
+                    )
+    if "inventory_opening" in history:
+        opening = history["inventory_opening"]
+        if (
+            not isinstance(opening, dict)
+            or set(opening) != {
+                "base_asset", "quote_asset", "step_size", "quantity", "cost_quote", "start_index"
+            }
+            or not all(
+                isinstance(opening[key], str) and opening[key]
+                for key in ("base_asset", "quote_asset")
+            )
+            or isinstance(opening["start_index"], bool)
+            or not isinstance(opening["start_index"], int)
+            or not 0 <= opening["start_index"] <= len(fills)
+            or any("commissions" not in fill for fill in fills[opening["start_index"] :])
+        ):
+            raise RuntimeError(f"Invalid trade history file {path}: invalid inventory opening")
+        snapshot = inventory_snapshot(history)
+        if history.get("inventory") != snapshot:
+            raise RuntimeError(f"Invalid trade history file {path}: inconsistent inventory ledger")
     return history
 
 
@@ -852,6 +966,10 @@ def render_trade_operations_log(history: dict[str, Any]) -> str:
 
 
 def save_trade_history(path: Path, history: dict[str, Any]) -> None:
+    if "inventory_opening" in history:
+        history["inventory"] = inventory_snapshot(history)
+    if history["fills"]:
+        history["entry_guard"] = entry_guard(history)
     atomic_write_text(path, json.dumps(history, indent=2, sort_keys=True) + "\n")
     operations_path = trade_operations_log_path(
         path, history["symbol"], history["network"]
@@ -885,6 +1003,10 @@ def record_trade_fill(
     source: str,
     reasons: tuple[str, ...],
     signal_candle_close_time_ms: int | None = None,
+    *,
+    commissions: dict[str, str] | None = None,
+    info: dict[str, Any] | None = None,
+    position: Position | None = None,
 ) -> None:
     try:
         order_id = int(order["orderId"])
@@ -914,6 +1036,25 @@ def record_trade_fill(
             signal_candle_close_time_ms / 1000, timezone.utc
         ).isoformat()
     history = load_trade_history(path, symbol, network)
+    if commissions is not None:
+        fill["commissions"] = commissions
+        fill["executed_quantity"] = format(accounting_decimal(order["executedQty"]), "f")
+        fill["executed_quote_quantity"] = format(accounting_decimal(order["cummulativeQuoteQty"]), "f")
+        if "inventory_opening" not in history:
+            if info is None:
+                raise RuntimeError("Inventory accounting requires symbol filters")
+            # A legacy position is an explicit ownership checkpoint, never an account balance.
+            start_index = next(
+                (index for index, previous in enumerate(history["fills"])
+                 if previous["order_id"] == order_id),
+                len(history["fills"]),
+            )
+            history["inventory_opening"] = inventory_opening(info, position, start_index)
+        if info is not None:
+            opening = history["inventory_opening"]
+            if opening["base_asset"] != info["baseAsset"] or opening["quote_asset"] != info["quoteAsset"]:
+                raise RuntimeError("Inventory ledger asset identity mismatch")
+            opening["step_size"] = filter_value(info, "LOT_SIZE", "stepSize") or "0"
     for index, existing in enumerate(history["fills"]):
         if existing["order_id"] == order_id:
             if existing["side"] != side or existing["source"] != source:
@@ -931,6 +1072,34 @@ def record_trade_fill(
                 raise RuntimeError(
                     f"Trade history order {order_id} terminal status regressed"
                 )
+            same_quantity = accounting_decimal(order["executedQty"]) == accounting_decimal(
+                existing.get("executed_quantity", existing["quantity"])
+            )
+            if "commissions" in existing and commissions is not None:
+                assets = existing["commissions"].keys() | commissions.keys()
+                if any(
+                    accounting_decimal(commissions.get(asset, "0"))
+                    < accounting_decimal(existing["commissions"].get(asset, "0"))
+                    for asset in assets
+                ):
+                    raise RuntimeError(f"Trade history order {order_id} cumulative commission regressed")
+                if same_quantity and any(
+                    accounting_decimal(commissions.get(asset, "0"))
+                    != accounting_decimal(existing["commissions"].get(asset, "0"))
+                    for asset in assets
+                ):
+                    raise RuntimeError(f"Trade history order {order_id} commissions changed")
+            if same_quantity:
+                if accounting_decimal(order["cummulativeQuoteQty"]) != accounting_decimal(
+                    existing.get("executed_quote_quantity", existing["quote_quantity"])
+                ):
+                    raise RuntimeError(f"Trade history order {order_id} quote changed without a new fill")
+                fill["timestamp_utc"] = existing["timestamp_utc"]
+                for key in ("commissions", "executed_quantity", "executed_quote_quantity"):
+                    if key in existing:
+                        fill[key] = existing[key]
+            if "signal_candle_close_time_utc" in existing:
+                fill["signal_candle_close_time_utc"] = existing["signal_candle_close_time_utc"]
             history["fills"][index] = fill
             break
     else:
@@ -998,6 +1167,10 @@ def record_and_log_hosted_fill(
     reasons: tuple[str, ...],
     entry_price: float,
     quote_asset: str,
+    *,
+    client: BinanceClient,
+    info: dict[str, Any],
+    position: Position,
 ) -> None:
     order_id = int(order["orderId"])
     quantity = float(order.get("executedQty", 0))
@@ -1012,7 +1185,8 @@ def record_and_log_hosted_fill(
         if previous is not None:
             previous_quantity = float(previous["quantity"])
             previous_quote = float(previous["quote_quantity"])
-        record_trade_fill(
+        record_accounted_fill(
+            client,
             path,
             symbol,
             network,
@@ -1020,7 +1194,11 @@ def record_and_log_hosted_fill(
             "SELL",
             "hosted_stop_loss",
             reasons,
+            info,
+            position,
         )
+    except PendingIntentError:
+        raise
     except (OSError, RuntimeError) as error:
         raise TradeJournalError(
             f"hosted stop fill could not be recorded in {path}; trading stopped: {error}"
@@ -1045,31 +1223,95 @@ def record_and_log_hosted_fill(
     )
 
 
-def buy_cooldown_reason(
-    history: dict[str, Any], closed_candles: list[Candle], cooldown_candles: int
-) -> str | None:
-    if cooldown_candles <= 0:
-        return None
-    strategy_sells = [
-        fill
-        for fill in history["fills"]
-        if fill["side"] == "SELL" and fill["source"] == "strategy"
-    ]
-    if not strategy_sells:
-        return None
-    latest = max(strategy_sells, key=lambda fill: fill["timestamp_utc"])
-    timestamp = latest.get("signal_candle_close_time_utc", latest["timestamp_utc"])
+def timestamp_ms(timestamp: str) -> int:
     try:
-        sell_close_ms = int(datetime.fromisoformat(timestamp).timestamp() * 1000)
+        parsed = datetime.fromisoformat(timestamp)
+        if parsed.tzinfo is None:
+            raise ValueError("missing timezone")
+        return int(parsed.timestamp() * 1000)
     except (TypeError, ValueError) as error:
-        raise RuntimeError("Trade history contains an invalid cooldown timestamp") from error
-    elapsed = sum(candle.close_time_ms > sell_close_ms for candle in closed_candles)
-    if elapsed >= cooldown_candles:
-        return None
-    return (
-        f"BUY blocked by post-sell cooldown: {elapsed}/{cooldown_candles} "
-        "closed candles elapsed"
+        raise RuntimeError("Trade history contains an invalid execution timestamp") from error
+
+
+def is_protective_sell(fill: dict[str, Any]) -> bool:
+    return fill["side"] == "SELL" and (
+        fill["source"] in {"hosted_stop_loss", "protective_market"}
+        or any(
+            reason.lower().startswith(("stop loss", "stop-loss", "trailing stop"))
+            for reason in fill.get("reasons", [])
+        )
     )
+
+
+def entry_guard(history: dict[str, Any]) -> dict[str, Any]:
+    buys = [fill for fill in history["fills"] if fill["side"] == "BUY"]
+    stops = [fill for fill in history["fills"] if is_protective_sell(fill)]
+    latest_buy = max(buys, key=lambda fill: timestamp_ms(fill["timestamp_utc"]), default=None)
+    latest_stop = max(stops, key=lambda fill: timestamp_ms(fill["timestamp_utc"]), default=None)
+    return {
+        "last_buy_signal_candle_close_time_utc": max(
+            (fill.get("signal_candle_close_time_utc", fill["timestamp_utc"]) for fill in buys),
+            key=timestamp_ms,
+            default=None,
+        ),
+        "last_buy_execution_time_utc": latest_buy["timestamp_utc"] if latest_buy else None,
+        "last_stop_execution_time_utc": latest_stop["timestamp_utc"] if latest_stop else None,
+        "requires_rearm": latest_stop is not None and (
+            latest_buy is None
+            or timestamp_ms(latest_stop["timestamp_utc"]) >= timestamp_ms(latest_buy["timestamp_utc"])
+        ),
+    }
+
+
+def buy_cooldown_reason(
+    history: dict[str, Any], closed_candles: list[Candle], cooldown_candles: int,
+    stop_cooldown_candles: int = 6,
+) -> str | None:
+    # Check all sales: a later normal exit must not shorten a still-active stop cooldown.
+    for fill in sorted(
+        history["fills"], key=lambda fill: timestamp_ms(fill["timestamp_utc"]), reverse=True
+    ):
+        if fill["side"] != "SELL":
+            continue
+        protective = is_protective_sell(fill)
+        required = max(cooldown_candles, stop_cooldown_candles) if protective else cooldown_candles
+        elapsed = len({
+            candle.close_time_ms for candle in closed_candles
+            if candle.close_time_ms > timestamp_ms(fill["timestamp_utc"])
+        })
+        if elapsed < required:
+            return (
+                f"BUY blocked by post-{'stop' if protective else 'sell'} cooldown: "
+                f"{elapsed}/{required} closed candles elapsed"
+            )
+    return None
+
+
+def buy_entry_block_reason(
+    history: dict[str, Any], closed_candles: list[Candle], config: StrategyConfig
+) -> str | None:
+    guard = entry_guard(history)
+    latest_close = closed_candles[-1].close_time_ms
+    previous_signal = guard["last_buy_signal_candle_close_time_utc"]
+    if previous_signal is not None and latest_close <= timestamp_ms(previous_signal):
+        return "BUY blocked: this candle/signal was already used by a prior BUY"
+    cooldown = buy_cooldown_reason(
+        history, closed_candles, config.cooldown_candles, config.stop_cooldown_candles
+    )
+    if cooldown is not None:
+        return cooldown
+    if not guard["requires_rearm"]:
+        return None
+    stop_time = timestamp_ms(guard["last_stop_execution_time_utc"])
+    age = latest_bullish_crossover_age([candle.close for candle in closed_candles], config)
+    if latest_close <= stop_time or age is None or closed_candles[-1 - age].close_time_ms <= stop_time:
+        return "BUY blocked: post-stop rearm requires a new bullish crossover after the stop"
+    return None
+
+
+def candle_after_entry(history: dict[str, Any], close_time_ms: int | None) -> bool:
+    entry_time = entry_guard(history)["last_buy_execution_time_utc"]
+    return close_time_ms is not None and (entry_time is None or close_time_ms > timestamp_ms(entry_time))
 
 
 def filter_value(symbol_info: dict[str, Any], filter_type: str, key: str) -> str | None:
@@ -1239,6 +1481,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("buy RSI range must satisfy 0 <= --buy-rsi-min <= --buy-rsi-max <= 100")
     if args.cooldown_candles < 0:
         raise ValueError("--cooldown-candles cannot be negative")
+    if getattr(args, "stop_cooldown_candles", 6) < args.cooldown_candles:
+        raise ValueError("--stop-cooldown-candles must be at least --cooldown-candles")
     previous_trigger = -math.inf
     previous_protection = -math.inf
     for trigger, protection in args.trailing_thresholds:
@@ -1414,7 +1658,7 @@ def finish_cancel_prerequisite(
         )
         raise
     initial_quantity = float(intent["position_quantity"])
-    remaining = max(0.0, initial_quantity - canceled_quantity)
+    remaining = remaining_quantity(initial_quantity, canceled_quantity)
     updated_position = (
         Position(
             intent["symbol"],
@@ -1428,7 +1672,8 @@ def finish_cancel_prerequisite(
     )
     if canceled_quantity > 0:
         try:
-            record_trade_fill(
+            journal = record_accounted_fill(
+                client,
                 history_path,
                 intent["symbol"],
                 intent["network"],
@@ -1436,7 +1681,16 @@ def finish_cancel_prerequisite(
                 "SELL",
                 "hosted_stop_loss",
                 ("hosted stop-loss partially filled during cancellation prerequisite",),
+                info,
+                Position(intent["symbol"], initial_quantity, float(intent["entry_price"])),
             )
+            remaining = min(remaining, inventory_sellable_quantity(journal, info))
+            updated_position = (
+                Position(intent["symbol"], remaining, float(intent["entry_price"]), None, intent["prior_stop_price"])
+                if remaining > 0 else None
+            )
+        except PendingIntentError:
+            raise
         except (OSError, RuntimeError) as error:
             raise TradeJournalError(
                 f"hosted stop fill could not be recorded in {history_path}; "
@@ -1573,102 +1827,121 @@ def validate_hosted_stop_order(
     return status, executed, original
 
 
-def recovered_buy_quantity(
-    client: BinanceClient,
-    intent: dict[str, Any],
-    order: dict[str, Any],
-    order_id: int,
-    executed: float,
-    quote: float,
-    base_asset: str,
-) -> float:
-    fills = order.get("fills")
-    if fills is not None:
-        if not isinstance(fills, list) or not fills:
-            raise PendingIntentError(
-                f"order intent {intent['client_order_id']} returned invalid BUY fills"
-            )
+def execution_commissions(
+    client: BinanceClient, symbol: str, order: dict[str, Any]
+) -> tuple[dict[str, str], int | None, str, str]:
+    """Verify a complete execution breakdown before crediting bot-owned inventory."""
+    rows = order.get("fills")
+    from_trades = rows is None
+    if from_trades:
         try:
-            commission = 0.0
-            total_quantity = 0.0
-            total_quote = 0.0
-            for fill in fills:
-                if not isinstance(fill, dict) or not isinstance(
-                    fill.get("commissionAsset"), str
-                ):
-                    raise ValueError("invalid fill")
-                value = float(fill["commission"])
-                quantity = float(fill["qty"])
-                quote_quantity = (
-                    float(fill["quoteQty"])
-                    if "quoteQty" in fill
-                    else quantity * float(fill["price"])
-                )
-                if not all(
-                    math.isfinite(number) and number >= 0
-                    for number in (value, quantity, quote_quantity)
-                ):
-                    raise ValueError("invalid commission")
-                total_quantity += quantity
-                total_quote += quote_quantity
-                if fill["commissionAsset"] == base_asset:
-                    commission += value
-        except (KeyError, TypeError, ValueError) as error:
-            raise PendingIntentError(
-                f"order intent {intent['client_order_id']} returned invalid BUY commission"
-            ) from error
-        if not math.isclose(total_quantity, executed, rel_tol=1e-9, abs_tol=1e-12) or not math.isclose(
-            total_quote, quote, rel_tol=1e-9, abs_tol=1e-12
-        ):
-            raise PendingIntentError(
-                f"order intent {intent['client_order_id']} BUY fill totals are inconsistent"
-            )
-        return executed - commission
-
+            rows = client.trades(symbol, int(order["orderId"]))
+        except (AttributeError, BinanceError, OSError, RuntimeError, ValueError) as error:
+            raise PendingIntentError(f"Order {order['orderId']} execution commissions are unavailable") from error
+    if not isinstance(rows, list) or not rows:
+        raise PendingIntentError(f"Order {order['orderId']} execution trades are incomplete")
+    total_quantity = Decimal(0)
+    total_quote = Decimal(0)
+    fees: dict[str, Decimal] = {}
+    execution_times = []
+    seen_trade_ids = set()
     try:
-        trades = client.trades(intent["symbol"], order_id)
-    except (AttributeError, BinanceError, OSError, RuntimeError, ValueError) as error:
-        raise PendingIntentError(
-            f"order intent {intent['client_order_id']} BUY trades are unavailable"
-        ) from error
-    if not isinstance(trades, list) or not trades:
-        raise PendingIntentError(
-            f"order intent {intent['client_order_id']} BUY trades are incomplete"
-        )
-    total_quantity = 0.0
-    total_quote = 0.0
-    base_commission = 0.0
-    try:
-        for trade in trades:
-            if (
-                not isinstance(trade, dict)
-                or trade.get("orderId") != order_id
-                or ("symbol" in trade and trade["symbol"] != intent["symbol"])
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("invalid fill")
+            if from_trades and (
+                row.get("orderId") != order["orderId"]
+                or row.get("symbol", symbol) != symbol
+                or ("isBuyer" in row and row["isBuyer"] != (order.get("side") == "BUY"))
             ):
                 raise ValueError("trade identity mismatch")
-            quantity = float(trade["qty"])
-            quote_quantity = float(trade["quoteQty"])
-            commission = float(trade["commission"])
-            if not all(
-                math.isfinite(value) and value >= 0
-                for value in (quantity, quote_quantity, commission)
-            ):
-                raise ValueError("invalid trade quantity")
+            if "id" in row:
+                if row["id"] in seen_trade_ids:
+                    raise ValueError("duplicate trade")
+                seen_trade_ids.add(row["id"])
+            quantity = accounting_decimal(row["qty"])
+            quote = (
+                accounting_decimal(row["quoteQty"]) if "quoteQty" in row
+                else quantity * accounting_decimal(row["price"])
+            )
+            commission = accounting_decimal(row["commission"])
+            asset = row["commissionAsset"]
+            if quantity <= 0 or quote <= 0 or not isinstance(asset, str) or not asset:
+                raise ValueError("invalid execution")
             total_quantity += quantity
-            total_quote += quote_quantity
-            if trade.get("commissionAsset") == base_asset:
-                base_commission += commission
-    except (KeyError, TypeError, ValueError) as error:
-        raise PendingIntentError(
-            f"order intent {intent['client_order_id']} BUY trades are inconsistent"
-        ) from error
-    if not math.isclose(total_quantity, executed, rel_tol=1e-9, abs_tol=1e-12) or not math.isclose(
-        total_quote, quote, rel_tol=1e-9, abs_tol=1e-12
-    ):
-        raise PendingIntentError(
-            f"order intent {intent['client_order_id']} BUY trade totals are inconsistent"
+            total_quote += quote
+            fees[asset] = fees.get(asset, Decimal(0)) + commission
+            if "time" in row:
+                execution_time = int(row["time"])
+                if execution_time <= 0:
+                    raise ValueError("invalid execution time")
+                execution_times.append(execution_time)
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise PendingIntentError(f"Order {order['orderId']} execution commissions are inconsistent") from error
+    if not all(
+        math.isclose(float(actual), float(order[field]), rel_tol=1e-9, abs_tol=1e-12)
+        for actual, field in (
+            (total_quantity, "executedQty"), (total_quote, "cummulativeQuoteQty")
         )
-    return executed - base_commission
+    ):
+        raise PendingIntentError(f"Order {order['orderId']} execution trade totals are inconsistent")
+    return (
+        {asset: format(amount, "f") for asset, amount in fees.items()},
+        max(execution_times, default=None),
+        format(total_quantity, "f"),
+        format(total_quote, "f"),
+    )
+
+
+def record_accounted_fill(
+    client: BinanceClient, path: Path, symbol: str, network: str,
+    order: dict[str, Any], side: str, source: str, reasons: tuple[str, ...],
+    info: dict[str, Any], position: Position | None = None,
+    signal_candle_close_time_ms: int | None = None,
+) -> dict[str, Any]:
+    fees, execution_time, exact_quantity, exact_quote = execution_commissions(client, symbol, order)
+    history = load_trade_history(path, symbol, network)
+    if "inventory_opening" not in history and history["fills"] and history["fills"][0]["side"] == "BUY":
+        migrate_inventory_history(client, path, symbol, network, info, position)
+    if execution_time is not None:
+        order = {**order, "transactTime": execution_time}
+    order = {**order, "executedQty": exact_quantity, "cummulativeQuoteQty": exact_quote}
+    record_trade_fill(
+        path, symbol, network, order, side, source, reasons, signal_candle_close_time_ms,
+        commissions=fees, info=info, position=position,
+    )
+    return load_trade_history(path, symbol, network)
+
+
+def migrate_inventory_history(
+    client: BinanceClient, path: Path, symbol: str, network: str,
+    info: dict[str, Any], position: Position | None,
+) -> None:
+    """Recover legacy dust only from identified bot orders and their actual commissions."""
+    history = load_trade_history(path, symbol, network)
+    if "inventory_opening" in history:
+        return
+    fills = history["fills"]
+    if fills and fills[0]["side"] != "BUY":
+        # An incomplete journal cannot prove historical dust ownership.
+        LOGGER.warning("Inventory begins at the existing bot position; earlier dust is not provable")
+        history["inventory_opening"] = inventory_opening(info, position, len(fills))
+    else:
+        for fill in fills:
+            fees, execution_time, exact_quantity, exact_quote = execution_commissions(
+                client, symbol, {
+                    "orderId": fill["order_id"], "side": fill["side"],
+                    "executedQty": fill["quantity"], "cummulativeQuoteQty": fill["quote_quantity"],
+                },
+            )
+            fill["commissions"] = fees
+            fill["executed_quantity"] = exact_quantity
+            fill["executed_quote_quantity"] = exact_quote
+            if execution_time is not None:
+                fill["timestamp_utc"] = datetime.fromtimestamp(execution_time / 1000, timezone.utc).isoformat()
+        history["inventory_opening"] = inventory_opening(info, position if not fills else None, 0)
+    save_trade_history(path, history)
+    LOGGER.info("Bot-owned inventory ledger initialized: %s", history["inventory"])
 
 
 def reconcile_order_intent(
@@ -1688,24 +1961,8 @@ def reconcile_order_intent(
     kind = intent["kind"]
     if kind == "market_buy":
         if executed > 0 and quote > 0:
-            owned = recovered_buy_quantity(
+            journal = record_accounted_fill(
                 client,
-                intent,
-                order,
-                order_id,
-                executed,
-                quote,
-                info["baseAsset"],
-            )
-            if not math.isfinite(owned) or owned <= 0 or owned > executed:
-                raise PendingIntentError(
-                    f"order intent {intent['client_order_id']} returned invalid net BUY quantity"
-                )
-            step = filter_value(info, "LOT_SIZE", "stepSize") or "0"
-            quantity = floor_to_step(owned, step)
-            if quantity <= 0:
-                quantity = owned
-            record_trade_fill(
                 history_path,
                 intent["symbol"],
                 intent["network"],
@@ -1713,8 +1970,13 @@ def reconcile_order_intent(
                 "BUY",
                 intent["source"],
                 tuple(intent["reasons"]),
-                intent["signal_candle_close_time_ms"],
+                info,
+                signal_candle_close_time_ms=intent["signal_candle_close_time_ms"],
             )
+            owned = Decimal(journal["inventory"]["quantity"])
+            quantity = floor_to_step(owned, filter_value(info, "LOT_SIZE", "stepSize") or "0")
+            if quantity <= 0:
+                quantity = float(owned)
             save_position(
                 state_path,
                 Position(intent["symbol"], quantity, quote / executed),
@@ -1723,7 +1985,7 @@ def reconcile_order_intent(
             save_position(state_path, None)
     elif kind in {"strategy_sell", "protective_market_sell"}:
         initial_quantity = float(intent["position_quantity"])
-        remaining = max(0.0, initial_quantity - executed)
+        remaining = remaining_quantity(initial_quantity, executed)
         minimum = float(filter_value(info, "LOT_SIZE", "minQty") or 0)
         updated = (
             Position(
@@ -1737,7 +1999,8 @@ def reconcile_order_intent(
             else None
         )
         if executed > 0 and quote > 0:
-            record_trade_fill(
+            journal = record_accounted_fill(
+                client,
                 history_path,
                 intent["symbol"],
                 intent["network"],
@@ -1745,7 +2008,14 @@ def reconcile_order_intent(
                 "SELL",
                 intent["source"],
                 tuple(intent["reasons"]),
+                info,
+                Position(intent["symbol"], initial_quantity, float(intent["entry_price"])),
                 intent["signal_candle_close_time_ms"],
+            )
+            remaining = min(remaining, inventory_sellable_quantity(journal, info))
+            updated = (
+                Position(intent["symbol"], remaining, float(intent["entry_price"]), None, intent["prior_stop_price"])
+                if remaining >= minimum and remaining > 0 else None
             )
         save_position(state_path, updated)
     else:
@@ -1753,7 +2023,8 @@ def reconcile_order_intent(
         if status in {"NEW", "PENDING_NEW", "PARTIALLY_FILLED"}:
             if executed > 0 and quote > 0:
                 try:
-                    record_trade_fill(
+                    record_accounted_fill(
+                        client,
                         history_path,
                         intent["symbol"],
                         intent["network"],
@@ -1761,7 +2032,11 @@ def reconcile_order_intent(
                         "SELL",
                         "hosted_stop_loss",
                         tuple(intent["reasons"]),
+                        info,
+                        Position(intent["symbol"], initial_quantity, float(intent["entry_price"])),
                     )
+                except PendingIntentError:
+                    raise
                 except (OSError, RuntimeError) as error:
                     raise TradeJournalError(
                         f"hosted stop fill could not be recorded in {history_path}; "
@@ -1805,11 +2080,12 @@ def reconcile_order_intent(
                 status,
             )
             return None
-        remaining = max(0.0, initial_quantity - executed)
+        remaining = remaining_quantity(initial_quantity, executed)
         minimum = float(filter_value(info, "LOT_SIZE", "minQty") or 0)
         if executed > 0 and quote > 0:
             try:
-                record_trade_fill(
+                journal = record_accounted_fill(
+                    client,
                     history_path,
                     intent["symbol"],
                     intent["network"],
@@ -1817,7 +2093,12 @@ def reconcile_order_intent(
                     "SELL",
                     "hosted_stop_loss",
                     tuple(intent["reasons"]),
+                    info,
+                    Position(intent["symbol"], initial_quantity, float(intent["entry_price"])),
                 )
+                remaining = min(remaining, inventory_sellable_quantity(journal, info))
+            except PendingIntentError:
+                raise
             except (OSError, RuntimeError) as error:
                 raise TradeJournalError(
                     f"hosted stop fill could not be recorded in {history_path}; "
@@ -2043,6 +2324,9 @@ def execute_protective_market_exit(
     intent_path = order_intent_path(state_path, args.symbol, network)
     reference_price = client.ticker_price(args.symbol)
     available = min(position.quantity, client.free_balance(info["baseAsset"]))
+    journal = load_trade_history(history_path, args.symbol, network)
+    if "inventory" in journal:
+        available = min(available, float(journal["inventory"]["quantity"]))
     quantity = market_sell_quantity(available, reference_price, info)
     intent = prepare_order_intent(
         intent_path,
@@ -2088,17 +2372,24 @@ def ensure_hosted_stop(
     history_path: Path,
     network: str,
     closed_price: float,
+    *,
+    closed_time_ms: int | None = None,
+    initial: bool = False,
 ) -> tuple[Position | None, bool]:
     if position.stop_order_id is not None or not args.hosted_stop_loss or config.stop_loss_pct <= 0:
         return position, False
+    history = load_trade_history(history_path, args.symbol, network)
+    eligible_price = (
+        closed_price if not initial and candle_after_entry(history, closed_time_ms)
+        else position.entry_price
+    )
     desired_stop = trailing_stop_price(
-        position.entry_price,
-        closed_price,
-        config.stop_loss_pct,
-        config.trailing_thresholds,
+        position.entry_price, eligible_price, config.stop_loss_pct, config.trailing_thresholds
     )
     desired_stop = max(desired_stop, position.stop_price or 0.0)
     available = min(position.quantity, client.free_balance(info["baseAsset"]))
+    if "inventory" in history:
+        available = min(available, float(history["inventory"]["quantity"]))
     stop_quantity, desired_stop = stop_order_values(available, desired_stop, info)
     live_price = client.ticker_price(args.symbol)
     if live_price <= desired_stop:
@@ -2180,7 +2471,13 @@ def tighten_hosted_stop(
     stop_order: dict[str, Any],
     history_path: Path,
     network: str,
+    *,
+    closed_time_ms: int | None = None,
 ) -> Position | None:
+    if closed_time_ms is not None and not candle_after_entry(
+        load_trade_history(history_path, args.symbol, network), closed_time_ms
+    ):
+        return position
     profit_pct = (closed_price / position.entry_price - 1) * 100
     if not any(profit_pct >= trigger for trigger, _ in config.trailing_thresholds):
         return position
@@ -2332,6 +2629,7 @@ def execute_cycle(
             config.slow_sma + config.buy_crossover_lookback_candles,
             config.rsi_period + 1,
             config.cooldown_candles + 1,
+            config.stop_cooldown_candles + 1,
         )
         + 1
     )
@@ -2359,6 +2657,7 @@ def execute_cycle(
             history_path,
             network,
             closes[-1],
+            closed_time_ms=latest_close_time_ms,
         )
 
     if args.execute and position is not None and position.stop_order_id is not None:
@@ -2380,6 +2679,9 @@ def execute_cycle(
                 (stop_reason,),
                 position.entry_price,
                 info["quoteAsset"],
+                client=client,
+                info=info,
+                position=position,
             )
         if stop_status == "FILLED" or hosted_stop_executed >= position.quantity:
             save_position(state_path, None)
@@ -2389,7 +2691,10 @@ def execute_cycle(
         elif stop_status in {"NEW", "PENDING_NEW", "PARTIALLY_FILLED"}:
             hosted_stop_order = stop_order
         else:
-            remaining = max(0.0, position.quantity - hosted_stop_executed)
+            remaining = remaining_quantity(position.quantity, hosted_stop_executed)
+            journal = load_trade_history(history_path, args.symbol, network)
+            if "inventory" in journal:
+                remaining = min(remaining, inventory_sellable_quantity(journal, info))
             position = (
                 Position(
                     position.symbol,
@@ -2421,6 +2726,7 @@ def execute_cycle(
                     history_path,
                     network,
                     closes[-1],
+                    closed_time_ms=latest_close_time_ms,
                 )
                 hosted_stop_filled = hosted_stop_filled or protective_exit
                 if position is not None and position.stop_order_id is not None:
@@ -2439,6 +2745,7 @@ def execute_cycle(
         )
 
     decision = decide(closes, config, position)
+    history = load_trade_history(history_path, args.symbol, network)
     if intent_existed_at_start:
         decision = Decision(
             "HOLD",
@@ -2457,13 +2764,14 @@ def execute_cycle(
             decision.slow_sma,
             decision.rsi,
         )
+    elif position is not None and not candle_after_entry(history, latest_close_time_ms):
+        decision = Decision(
+            "HOLD", ("waiting for the first closed candle after the BUY execution",),
+            decision.price, decision.fast_sma, decision.slow_sma, decision.rsi,
+        )
 
     if decision.action == "BUY":
-        cooldown_reason = buy_cooldown_reason(
-            load_trade_history(history_path, args.symbol, network),
-            closed_candles,
-            config.cooldown_candles,
-        )
+        cooldown_reason = buy_entry_block_reason(history, closed_candles, config)
         if cooldown_reason is not None:
             decision = Decision(
                 "HOLD",
@@ -2487,6 +2795,8 @@ def execute_cycle(
             )
         else:
             available_for_exit = min(position.quantity, client.free_balance(info["baseAsset"]))
+        if "inventory" in history:
+            available_for_exit = min(available_for_exit, float(history["inventory"]["quantity"]))
         try:
             sell_quantity = market_sell_quantity(available_for_exit, sell_reference_price, info)
         except ValueError as error:
@@ -2529,6 +2839,7 @@ def execute_cycle(
                 hosted_stop_order,
                 history_path,
                 network,
+                closed_time_ms=latest_close_time_ms,
             )
         return decision
 
@@ -2609,6 +2920,8 @@ def execute_cycle(
                     history_path,
                     network,
                     decision.price,
+                    closed_time_ms=latest_close_time_ms,
+                    initial=True,
                 )
             except BinanceError as error:
                 LOGGER.critical(
@@ -2659,6 +2972,7 @@ def execute_cycle(
                     history_path,
                     network,
                     decision.price,
+                    closed_time_ms=latest_close_time_ms,
                 )
             except (BinanceError, ValueError) as error:
                 raise BinanceError(
@@ -2720,7 +3034,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--buy-on-bullish-trend",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Require a strong rising bullish SMA crossover (default: enabled)",
+        help="Require a rising bullish SMA trend (default: enabled)",
     )
     parser.add_argument(
         "--sell-on-bearish-trend",
@@ -2752,7 +3066,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--cooldown-candles",
         type=int,
         default=3,
-        help="Closed candles to block entries after a strategy sell (default: 3)",
+        help="Closed candles after any normal sell execution before another BUY (default: 3)",
+    )
+    parser.add_argument(
+        "--stop-cooldown-candles", type=int, default=6,
+        help="Closed candles after a stop/protective sell; also requires a fresh bullish crossover (default: 6)",
     )
     parser.add_argument(
         "--trailing-thresholds",
@@ -2839,6 +3157,7 @@ def main(argv: list[str] | None = None) -> int:
             buy_rsi_min=args.buy_rsi_min,
             buy_rsi_max=args.buy_rsi_max,
             cooldown_candles=args.cooldown_candles,
+            stop_cooldown_candles=args.stop_cooldown_candles,
             trailing_thresholds=args.trailing_thresholds,
         )
         client = BinanceClient(
@@ -2851,6 +3170,14 @@ def main(argv: list[str] | None = None) -> int:
             raise BinanceError(f"{args.symbol} is not currently trading")
         if args.execute:
             client.synchronize_time()
+            pending = load_order_intent(
+                order_intent_path(Path(args.state_file), args.symbol, network), args.symbol, network
+            )
+            if pending is None:
+                migrate_inventory_history(
+                    client, history_path, args.symbol, network, info,
+                    load_position(Path(args.state_file), args.symbol),
+                )
 
         while True:
             try:

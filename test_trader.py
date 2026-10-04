@@ -79,6 +79,11 @@ def binance_order(
     }
     if orig_qty is not None:
         result["origQty"] = str(orig_qty)
+    if fills is None and side == "SELL" and float(executed) > 0:
+        fills = [{
+            "qty": str(executed), "quoteQty": str(quote),
+            "commission": "0", "commissionAsset": "USDT",
+        }]
     if fills is not None:
         result["fills"] = fills
     return result
@@ -1950,7 +1955,7 @@ class DecisionTests(unittest.TestCase):
             None,
         )
         self.assertEqual(result.action, "BUY")
-        self.assertIn("bullish SMA crossover confirmed", result.reasons[0])
+        self.assertIn("bullish SMA trend confirmed", result.reasons[0])
 
     def test_buys_when_gap_confirms_one_candle_after_crossover(self):
         result = decide(
@@ -1972,7 +1977,7 @@ class DecisionTests(unittest.TestCase):
     def test_holds_when_fast_sma_was_already_above_slow_sma(self):
         result = decide([10, 10, 10, 11, 12, 13, 14], config(), None)
         self.assertEqual(result.action, "HOLD")
-        self.assertIn("no bullish SMA crossover in the last 3", result.reasons[0])
+        self.assertIn("RSI 100.00 above maximum 70", result.reasons[0])
 
     def test_low_rsi_failure_is_worded_as_a_failure(self):
         result = decide(

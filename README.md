@@ -40,16 +40,19 @@ python3 trader.py \
   --stop-loss-pct 2 \
   --take-profit-pct 4 \
   --cooldown-candles 3 \
+  --stop-cooldown-candles 6 \
   --trailing-thresholds 1:0,2:1,3:2 \
   --log-file trader-BTCUSDT-testnet.log \
   --execute
 ```
 
-Entry rules are combined with **AND**. A normal bullish crossover arms an entry for three completed candles by default, allowing time for the required 0.10% SMA gap to form. The latest candle must also have rising fast and slow SMAs, a faster fast-SMA slope, and RSI from 50 through 70. Configure the confirmation window with `--buy-crossover-lookback-candles`. A strategy sell starts a three-completed-candle entry cooldown.
+Entry rules are combined with **AND**. Entries require the fast SMA above the slow SMA, both SMAs rising, the configured minimum gap (0.10% by default), and RSI from 50 through 70. Continuation entries are allowed during normal operation. Each BUY signal candle can be used only once, including across position closure and restarts.
+
+Every executed SELL starts an entry cooldown, counted from its actual execution time using unique completed-candle closes. Normal exits use `--cooldown-candles` (default: 3). Stop-loss, hosted trailing-stop, and protective market exits use `--stop-cooldown-candles` (default: 6, at least the normal cooldown), even if the exit made a profit. After a protective exit, another BUY also requires a bullish crossover **after** that exit, within the confirmation window configured by `--buy-crossover-lookback-candles` (default: 3). Waiting out the cooldown alone does not permit a continuation entry. Partial fills count as executions; merely canceling or replacing an unfilled stop does not.
 
 Exit rules are combined with **OR**. The SMA exit requires the fast SMA below the slow SMA, a falling slow SMA, and the configured minimum bearish gap, so tiny crosses are ignored. Price, RSI, stop-loss, and take-profit exits remain independent.
 
-Signals and trailing-stop changes use completed candles only; the currently forming candle is ignored. The initial hosted stop is 2% below entry by default. With `--trailing-thresholds 1:0,2:1,3:2`, a completed-candle gain of 1% moves it to breakeven, 2% protects 1%, and 3% protects 2%.
+Signals and trailing-stop changes use completed candles only; the currently forming candle is ignored. The initial hosted stop is 2% below the actual BUY execution price by default. Pre-entry candles cannot tighten that stop or trigger a strategy exit, including after a restart. With `--trailing-thresholds 1:0,2:1,3:2`, a post-entry completed-candle gain of 1% moves it to breakeven, 2% protects 1%, and 3% protects 2%.
 
 Use `python3 trader.py --help` to see every flag. Examples:
 
@@ -78,6 +81,10 @@ python3 trader.py --no-sell-on-bearish-trend --sell-above 75000 --once
 - By default, a configured stop-loss is submitted to Binance after a filled buy and remains active when the script exits. Its order ID is saved in the state file. Use `--no-hosted-stop-loss` only if process-managed stops are intentional.
 - Before buying, the bot verifies that the rounded sell quantity at the stop price will satisfy Binance's minimum notional. Small buys can be rejected without placing an order.
 - Every filled buy is reconciled with the available balance so base-asset commission is excluded from the saved sellable quantity.
+- The fill journal also contains a Decimal-based bot-owned inventory ledger (`inventory_opening` and `inventory`), including total quantity, remaining quote cost, fractional `residual_quantity`, and its cost. Rounding for an order does not discard ownership: the next BUY combines its net acquisition with the bot's remaining inventory. Account balances only limit availability; unrelated holdings are never credited to the ledger.
+- BUY and SELL commissions are recorded by asset. Base-asset commissions reduce owned inventory; quote-asset BUY commissions enter its cost basis. Third-asset fees remain recorded in their native units. The ledger cost basis is separate from the latest execution price used by strategy stops.
+- Inventory and entry guards are saved atomically with cumulative order records. Recovery replays/upserts each order, including partial fills, without crediting or consuming dust twice. Missing or inconsistent execution breakdowns leave reconciliation pending instead of assuming zero commissions.
+- On the first execution-enabled startup, legacy journals beginning with a BUY are migrated by retrieving actual executions/commissions for those identified bot orders. An unavailable or inconsistent breakdown stops migration without guessing ownership. For incomplete journals beginning with a SELL, only the existing bot position is adopted as an explicit ownership checkpoint; earlier dust cannot be proven from that journal. Dry-run does not query private trade executions.
 - Before a market exit, the bot checks the rounded quantity against Binance's applicable market notional using its configured average-price window. An undersized exit is deferred as `HOLD` without submitting a rejected order; state is preserved, and an active hosted stop is not canceled unless the precheck passes.
 - Only one bot process per user can use a symbol/network combination. Testnet and mainnet use separate locks.
 - A state file is written only after an executed buy. Dry-run decisions do not simulate holdings.
