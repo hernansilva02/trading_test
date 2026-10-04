@@ -1594,6 +1594,21 @@ class RuntimeSafetyTests(unittest.TestCase):
                 handler.flush()
             self.assertIn("BTCUSDT BUY filled", path.read_text())
 
+    def test_terminal_signals_are_colored(self):
+        class TerminalBuffer(io.StringIO):
+            def isatty(self):
+                return True
+
+        output = TerminalBuffer()
+        with patch("sys.stderr", output):
+            configure_logging(False, None)
+            logging.getLogger("trader").info("HOLD BUY SELL")
+
+        rendered = output.getvalue()
+        self.assertIn("\033[34mHOLD\033[0m", rendered)
+        self.assertIn("\033[31mBUY\033[0m", rendered)
+        self.assertIn("\033[32mSELL\033[0m", rendered)
+
 
 class TrailingStopTests(unittest.TestCase):
     def setUp(self):

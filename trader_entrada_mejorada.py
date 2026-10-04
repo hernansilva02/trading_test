@@ -109,8 +109,8 @@ class StrategyConfig:
     sell_rsi_above: float | None
     stop_loss_pct: float
     take_profit_pct: float
-    min_sma_gap_pct: float = 0.05
-    buy_crossover_lookback_candles: int = 5
+    min_sma_gap_pct: float = 0.1
+    buy_crossover_lookback_candles: int = 3
     buy_rsi_min: float = 50.0
     buy_rsi_max: float = 70.0
     cooldown_candles: int = 3

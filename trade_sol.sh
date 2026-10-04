@@ -8,7 +8,7 @@ python3 /home/hernan/trading/trader.py \
   --slow-sma 21 \
   --min-sma-gap-pct 0.10 \
   --buy-crossover-lookback-candles 3 \
-  --buy-rsi-min 50 \
+  --buy-rsi-min 45 \
   --buy-rsi-max 70 \
   --cooldown-candles 3 \
   --trailing-thresholds 1:0,2:1,3:2 \

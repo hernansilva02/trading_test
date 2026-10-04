@@ -1,6 +1,6 @@
 #!/bin/bash
 python3 /home/hernan/trading/trader.py \
-  --symbol SOLUSDT \
+  --symbol SUIUSDT \
   --interval 15m \
   --poll-seconds 60 \
   --quote-size 10 \
@@ -15,7 +15,7 @@ python3 /home/hernan/trading/trader.py \
   --stop-loss-pct 2 \
   --take-profit-pct 4 \
   --hosted-stop-loss \
-  --state-file /home/hernan/trading/.trader-state-SOLUSDT-testnet.json \
-  --log-file /home/hernan/trading/trader-SOLUSDT-testnet.log \
+  --state-file /home/hernan/trading/.trader-state-SUIUSDT-testnet.json \
+  --log-file /home/hernan/trading/trader-SUIUSDT-testnet.log \
   --execute \
   --verbose
