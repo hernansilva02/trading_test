@@ -20,7 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
@@ -1460,13 +1460,17 @@ def parse_trailing_thresholds(value: str) -> tuple[tuple[float, float], ...]:
     return thresholds
 
 
-def validate_args(args: argparse.Namespace) -> None:
+def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
+    return StrategyConfig(**{field.name: getattr(args, field.name) for field in fields(StrategyConfig)})
+
+
+def validate_strategy_args(args: argparse.Namespace) -> None:
     if args.fast_sma <= 0 or args.slow_sma <= 0 or args.rsi_period <= 0:
         raise ValueError("SMA windows and RSI period must be positive")
     if args.fast_sma >= args.slow_sma:
         raise ValueError("--fast-sma must be smaller than --slow-sma")
-    if args.quote_size <= 0 or args.poll_seconds <= 0:
-        raise ValueError("--quote-size and --poll-seconds must be positive")
+    if not math.isfinite(args.quote_size) or args.quote_size <= 0:
+        raise ValueError("--quote-size must be finite and positive")
     for name in ("buy_rsi_below", "sell_rsi_above"):
         value = getattr(args, name)
         if value is not None and not 0 <= value <= 100:
@@ -1501,6 +1505,12 @@ def validate_args(args: argparse.Namespace) -> None:
             )
         previous_trigger = trigger
         previous_protection = protection
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    validate_strategy_args(args)
+    if not math.isfinite(args.poll_seconds) or args.poll_seconds <= 0:
+        raise ValueError("--poll-seconds must be finite and positive")
     if args.live and args.execute and not args.confirm_live:
         raise ValueError("live orders require --confirm-live")
 
@@ -3012,20 +3022,7 @@ def execute_cycle(
     return decision
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Rule-based Binance Spot trading bot")
-    parser.add_argument("--symbol", default="BTCUSDT", help="Binance pair (default: BTCUSDT)")
-    parser.add_argument("--interval", default="15m", help="Candle interval (default: 15m)")
-    parser.add_argument("--poll-seconds", type=float, default=60, help="Seconds between decisions")
-    parser.add_argument("--once", action="store_true", help="Run one decision cycle and exit")
-    parser.add_argument("--execute", action="store_true", help="Submit orders; otherwise dry-run")
-    parser.add_argument("--live", action="store_true", help="Use Binance mainnet instead of Spot Testnet")
-    parser.add_argument(
-        "--confirm-live",
-        action="store_true",
-        help="Acknowledge that --execute --live uses real funds",
-    )
-    parser.add_argument("--state-file", default=".trader-state.json", help="Bot-owned position state")
+def add_strategy_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quote-size", type=float, default=25, help="Quote asset spent per buy")
     parser.add_argument("--fast-sma", type=int, default=9)
     parser.add_argument("--slow-sma", type=int, default=21)
@@ -3085,6 +3082,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Place the stop at Binance after a filled buy (default: enabled)",
     )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Rule-based Binance Spot trading bot")
+    parser.add_argument("--symbol", default="BTCUSDT", help="Binance pair (default: BTCUSDT)")
+    parser.add_argument("--interval", default="15m", help="Candle interval (default: 15m)")
+    parser.add_argument("--poll-seconds", type=float, default=60, help="Seconds between decisions")
+    parser.add_argument("--once", action="store_true", help="Run one decision cycle and exit")
+    parser.add_argument("--execute", action="store_true", help="Submit orders; otherwise dry-run")
+    parser.add_argument("--live", action="store_true", help="Use Binance mainnet instead of Spot Testnet")
+    parser.add_argument(
+        "--confirm-live", action="store_true",
+        help="Acknowledge that --execute --live uses real funds",
+    )
+    parser.add_argument("--state-file", default=".trader-state.json", help="Bot-owned position state")
+    add_strategy_arguments(parser)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--log-file",
@@ -3140,26 +3153,7 @@ def main(argv: list[str] | None = None) -> int:
             trade_operations_log_path(Path(args.state_file), args.symbol, network),
         )
         LOGGER.info("Operational log: %s", args.log_file)
-        config = StrategyConfig(
-            fast_sma=args.fast_sma,
-            slow_sma=args.slow_sma,
-            rsi_period=args.rsi_period,
-            buy_on_bullish_trend=args.buy_on_bullish_trend,
-            sell_on_bearish_trend=args.sell_on_bearish_trend,
-            buy_below=args.buy_below,
-            sell_above=args.sell_above,
-            buy_rsi_below=args.buy_rsi_below,
-            sell_rsi_above=args.sell_rsi_above,
-            stop_loss_pct=args.stop_loss_pct,
-            take_profit_pct=args.take_profit_pct,
-            min_sma_gap_pct=args.min_sma_gap_pct,
-            buy_crossover_lookback_candles=args.buy_crossover_lookback_candles,
-            buy_rsi_min=args.buy_rsi_min,
-            buy_rsi_max=args.buy_rsi_max,
-            cooldown_candles=args.cooldown_candles,
-            stop_cooldown_candles=args.stop_cooldown_candles,
-            trailing_thresholds=args.trailing_thresholds,
-        )
+        config = strategy_config_from_args(args)
         client = BinanceClient(
             MAINNET_URL if args.live else TESTNET_URL,
             os.environ.get("BINANCE_API_KEY", ""),

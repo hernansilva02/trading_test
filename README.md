@@ -97,6 +97,108 @@ Real-fund execution, after testing, requires mainnet API credentials:
 python3 trader.py --symbol BTCUSDT --execute --live --confirm-live
 ```
 
+## Backtesting
+
+[`backtest.py`](backtest.py) simulates one Spot symbol using the same strategy arguments,
+SMA/RSI decision function, cooldowns, post-stop rearm, and dust accounting as `trader.py`.
+It uses only public Binance data, or an offline CSV, and starts with a separate simulated
+cash balance. It never submits orders or reads/writes the running bot's state or journal.
+
+Download a month of completed candles and evaluate the default strategy with 100 USDT
+and 10 USDT per entry:
+
+```bash
+python3 backtest.py \
+  --symbol BTCUSDT \
+  --interval 15m \
+  --start 2026-09-01 \
+  --end 2026-10-01 \
+  --initial-balance 100 \
+  --quote-size 10 \
+  --fee-pct 0.1 \
+  --slippage-pct 0.05 \
+  --save-csv reports/BTCUSDT-2026-09.csv \
+  --output reports/BTCUSDT-2026-09.json
+```
+
+Dates are UTC; the start is inclusive and the end is exclusive. Downloads paginate
+through Binance's 1,000-candle pages and include indicator warm-up before the requested
+start. Incomplete candles are discarded. Duplicate, unordered, missing, or invalid OHLCV
+bars are rejected so missing data cannot silently hide a stop. Monthly `1M` candles are
+not supported; `--interval` accepts fixed-duration Binance intervals.
+
+Repeat the run offline with the saved filter snapshot:
+
+```bash
+python3 backtest.py \
+  --symbol BTCUSDT --interval 15m \
+  --csv reports/BTCUSDT-2026-09.csv \
+  --filters-json reports/BTCUSDT-2026-09.json \
+  --start 2026-09-01 --end 2026-10-01 \
+  --initial-balance 100 --quote-size 10 \
+  --fee-pct 0.1 --slippage-pct 0.05 \
+  --output reports/BTCUSDT-2026-09-offline.json
+```
+
+All strategy flags are shared with the live trader. To evaluate a particular launcher,
+pass its SMA, RSI, stop, take-profit, cooldown, and trailing values to the backtester.
+Strategy defaults remain SMA 9/21, RSI 50–70, 2% stop, 4% target, and 3/6 candle cooldowns.
+The backtest defaults to a 100-unit quote balance, 10 per BUY, 0.1% fee per execution,
+0.05% adverse slippage per execution, base-asset BUY commission, and quote-asset SELL
+commission. `--buy-fee-asset quote` models BUY fees paid in quote instead.
+
+### Simulation and report
+
+- Signals use completed candles. Market BUY/SELL signals execute at the **next candle's
+  open**, with slippage; the simulator never buys retrospectively at its signal's close.
+- Hosted stops can execute inside a candle. A gap through a stop fills at the opening
+  price rather than the unavailable stop price. An intrabar touch fills at the stop price,
+  with adverse slippage; its timestamp is conservatively assigned to the candle close
+  because OHLCV cannot identify the exact touch time.
+- Take-profit uses closing prices, as in the live trader. Intrabar highs do not trigger
+  take-profit or advance trailing. A trailing update from a completed close becomes active
+  for the next candle; the initial stop uses the actual simulated BUY price.
+- Commissions, cash limits, quantity/tick rounding, protective minimum notional, and
+  bot-owned residual inventory are included. Dust remains part of equity and is combined
+  with a subsequent BUY. Cash cannot be borrowed.
+- By default, an open position is marked to the final close, including its remaining
+  inventory. `--close-at-end` requests an explicit final market sale and charges exit
+  costs; an exit below the symbol's minimum remains deferred.
+- The console summary and optional JSON report include final equity/cash, net return,
+  realized/unrealized P/L, commission cost, close-sampled maximum drawdown, closed trades,
+  win rate, net profit factor, blocked orders, remaining inventory/dust, complete fills,
+  trade records, and the equity curve. Undefined win rate/profit factor use JSON `null`.
+- Buy-and-hold invests **all initial capital**, with the same fee/slippage assumptions;
+  it is a fully invested benchmark, while the bot may use only a small part of its cash.
+
+Downloads use the **current** public symbol filters, which may differ from historical
+filters. `--filters-json` accepts a Binance symbol object, an `exchangeInfo` object, or
+the filter snapshot in a prior backtest report. CSV-only runs without a snapshot use
+generic defaults: quantity/tick step `0.00000001` and minimum notional `5` quote units.
+Use `--quantity-step`, `--price-tick`, `--min-quantity`, and `--min-notional` to specify
+the rules appropriate to the symbol/period. For example, an offline BNB simulation can
+use `--quantity-step 0.001 --price-tick 0.01 --min-notional 5` if those are its applicable
+rules. The JSON report records the actual rules and assumptions used.
+
+This is a bar-based model: it assumes complete market fills and no API/order latency,
+and uses execution price for minimum notional rather than Binance's historical average
+price window. Drawdown is sampled at candle closes, not every market tick. Consequently,
+it is a strategy evaluation rather than an exact reconstruction of live executions.
+
+Custom CSV files require:
+
+```csv
+open_time,open,high,low,close,volume
+2026-09-01T00:00:00Z,80000,80100,79900,80050,120
+2026-09-01T00:15:00Z,80050,80200,80000,80150,130
+```
+
+Include enough preceding rows for warm-up: at least `max(slow_sma + 1, rsi_period + 1)`
+before an explicit `--start`. Without `--start`, those initial rows are used only for
+warm-up. Timestamps can be ISO-8601 or epoch **milliseconds**; `open_time_ms` and optional
+`close_time`/`close_time_ms` columns are also accepted. If omitted, close time is derived
+from the selected interval. `--save-csv` writes the full loaded series including warm-up.
+
 ## Tests
 
 ```bash

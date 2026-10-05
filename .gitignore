@@ -11,3 +11,4 @@ binance_keys
 trader-*.log
 __pycache__/
 *.pyc
+current_server/
